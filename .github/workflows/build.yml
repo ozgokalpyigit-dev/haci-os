@@ -1,0 +1,110 @@
+name: Build Hacı OS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Aynı dalın sürümlerini sırayla yayımla; latest eski bir iş tarafından geri alınmasın.
+concurrency:
+  group: hacios-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      THEOS: ${{ runner.temp }}/hacios-theos
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Kaynak dosyalarını al
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Paketleme ve imzalama araçlarını kur
+        run: |
+          set -euo pipefail
+          brew install ldid make dpkg
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Resmî Theos deposunu alt modülleriyle kur
+        run: |
+          set -euo pipefail
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+
+      - name: Resmî depodan iOS 16 veya 15 SDK kur
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/theos/sdks.git "$RUNNER_TEMP/hacios-sdks"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+
+          source = Path(os.environ["RUNNER_TEMP"]) / "hacios-sdks"
+          candidates = []
+          for sdk in source.glob("iPhoneOS*.sdk"):
+              match = re.fullmatch(r"iPhoneOS(\d+)\.(\d+)(?:\.(\d+))?\.sdk", sdk.name)
+              if match and sdk.is_dir():
+                  version = tuple(int(part or 0) for part in match.groups())
+                  if version[0] in (15, 16):
+                      candidates.append((version, sdk))
+          if not candidates:
+              raise SystemExit("Resmî SDK deposunda iPhoneOS16.x veya 15.x SDK bulunamadı.")
+
+          version, sdk = max(candidates, key=lambda item: item[0])
+          destination = Path(os.environ["THEOS"]) / "sdks" / sdk.name
+          shutil.copytree(sdk, destination, symlinks=True, dirs_exist_ok=True)
+          print(f"Kurulan SDK: {sdk.name}")
+          PY
+
+      - name: Rootless deb paketini derle
+        run: |
+          set -euo pipefail
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+
+      - name: Sabit indirme adlı kopyayı oluştur
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(packages/*.deb)
+          if [[ ${#packages[@]} -ne 1 ]]; then
+            echo "Tam olarak bir deb paketi bekleniyordu; bulunan: ${#packages[@]}" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          cp "${packages[0]}" dist/HaciOS-latest.deb
+
+      - name: Deb dosyalarını artifact olarak yükle
+        uses: actions/upload-artifact@v4
+        with:
+          name: HaciOS-rootless-${{ github.run_number }}
+          path: |
+            packages/*.deb
+            dist/HaciOS-latest.deb
+          if-no-files-found: error
+
+      - name: GitHub sürümü ve kalıcı indirme bağlantısını yayımla
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.0.1-build.${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          name: Hacı OS 0.0.1 — build ${{ github.run_number }}
+          draft: false
+          prerelease: false
+          make_latest: "true"
+          fail_on_unmatched_files: true
+          files: |
+            packages/*.deb
+            dist/HaciOS-latest.deb
+          body: |
+            iPhone X / iOS 16.4.1 / Dopamine rootless / ElleKit için ilk hello-world paketi.
+            Kolay kurulum için HaciOS-latest.deb dosyasını indirin.

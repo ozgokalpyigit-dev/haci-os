@@ -1,0 +1,9 @@
+Package: com.yigit.hacios
+Name: Hacı OS
+Version: 0.0.1
+Architecture: iphoneos-arm64
+Description: SpringBoard açılışında geçici Hacı OS etiketi gösterir.
+Maintainer: Yigit
+Author: Yigit
+Section: Tweaks
+Depends: mobilesubstrate
