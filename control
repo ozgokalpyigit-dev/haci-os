@@ -1,8 +1,8 @@
 Package: com.yigit.hacios
 Name: Hacı OS
-Version: 0.0.1
+Version: 0.1.0
 Architecture: iphoneos-arm64
-Description: SpringBoard açılışında geçici Hacı OS etiketi gösterir.
+Description: Ana ekranda tam ekran Hacı Orbit arayüzü sunar (Aşama 3a).
 Maintainer: Yigit
 Author: Yigit
 Section: Tweaks

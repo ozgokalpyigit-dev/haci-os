@@ -1,45 +1,51 @@
-# Hacı OS 0.0.1
+# Hacı OS 0.1.0 — Aşama 3a
 
-iPhone X, iOS 16.4.1 ve Dopamine **rootless** jailbreak (ElleKit) için Theos
-SpringBoard tweak'i. Aşama 2'nin ilk sürümüdür: SpringBoard açılışından 2 saniye
-sonra üst ortada siyah, ince beyaz kenarlı `HACI OS 0.0.1` kapsülü gösterir;
-yaklaşık 3 saniye sonra kaybolur. Dokunmaları engellemez.
+iPhone X / iOS 16.4.1 / Dopamine rootless / ElleKit için SpringBoard tweak'i.
+Ana ekranda ikonları ve dock'u örten, yerel WKWebView içinde tam ekran **Hacı
+Orbit** gösterir. Önceki geçici kapsül kaldırılmıştır. WhatsApp ve Dosyalar ayrı
+ikonlardır; Claude `https://claude.ai` açar, Hacı şimdilik `YAKINDA` gösterir.
 
-Derleme yalnızca GitHub Actions'ta yapılır. `main` dalına push veya Actions →
-**Build Hacı OS → Run workflow** ile başlatılır. `macos-15` üzerinde resmî Theos
-alt modülleriyle kurulur; resmî SDK deposundaki en yeni 16.x, yoksa 15.x SDK
-seçilir. `make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless` iki mimariyi
-(`arm64`, `arm64e`) derler. Runner kaynaklı sorun olursa workflow'daki runner
-`macos-14` olarak değiştirilebilir. Çıktı artifact ve
-`v0.0.1-build.<run_number>` sürümü olarak yayımlanır. Yerel derleme veya cihaz
-testi yapılmamıştır; ilk Actions çalıştırması derleme hattını doğrulayacaktır.
+`orbit-prototip.html` tasarım kaynağıdır; paketlenen kopyası
+`layout/Library/Application Support/HaciOS/orbit.html` konumundadır. Theos'un
+`rootless` paket şeması `layout/` içeriğini kurulum öneki altına taşır; bu nedenle
+`layout/` içine ikinci bir `var/jb` eklenmez. Telefonda HTML yolu
+`/var/jb/Library/Application Support/HaciOS/orbit.html` olur ve tweak yolu
+`ROOT_PATH_NS` ile çözer. HTML güncellenirken paketlenen kopya da güncellenmelidir.
 
-## Telefona kurulum
+Uygulama ön plandayken, ana ekran görünmezken veya ekran kapalıyken animasyon,
+saat zamanlayıcısı ve CSS nabız animasyonu duraklar. Ana ekrana dönünce sürer.
+Tek overlay oluşturulur; tekrar görünme olayları aynı görünümü kullanır. Ana ekran
+sınıfı, `frontDisplayDidChange:` veya ekran bildirimi kullanılamıyorsa Orbit
+başlatılmaz. Kritik kayıtlar `[HaciOS]` önekiyle sistem günlüğüne yazılır.
 
-1. Safari'de kendi GitHub deponuzun
-   `https://github.com/<sahip>/<depo>/releases/latest/download/HaciOS-latest.deb`
-   adresini açın. `<sahip>` ve `<depo>` alanlarını değiştirin.
-2. İndirilen paketi Filza ile açıp kurun; paket yöneticiniz yerel `.deb` açmayı
-   destekliyorsa Sileo ile de kurabilirsiniz. ElleKit önceden kurulu olmalıdır;
-   paketin `mobilesubstrate` bağımlılığını sağlar.
-3. Respring yapın. Sistem günlüğünde `[HaciOS] loaded` ve etiket gösterildiğinde
-   `[HaciOS] badge shown` kayıtları beklenir.
+## Kurtarma
 
-## Kurtarma ve güvenli mod
+**Saate bir saniye içinde üç kez dokunun.** Normal ikonlar ve dock geri gelir;
+Orbit bir sonraki respring'e kadar gizli kalır.
 
-Filza ile aşağıdaki konumda boş bir dosya oluşturun (dosyanın varlığı yeterlidir):
+Kalıcı kapatma için Filza ile önceki sürümdeki konumda boş bir dosya oluşturun:
 
 ```text
 /var/jb/var/mobile/Library/Preferences/com.yigit.hacios.disabled
 ```
 
-Ardından respring yapın. Dosya varken Hacı OS hook'u ve gösterimi etkinleşmez.
-Yeniden etkinleştirmek için dosyayı silip respring yapın. Theos `rootless.h`
-mevcutsa yol `ROOT_PATH_NS` ile jbroot'a uyarlanır; yoksa `/var/jb` kullanılır.
+Respring sonrasında dosya varken hook'lar etkinleşmez. Yeniden etkinleştirmek
+için dosyayı silip respring yapın. SpringBoard açılmıyorsa Dopamine'in tweak
+yüklemeyi kapatma / güvenli mod seçeneğiyle açıp kapatma dosyasını oluşturun
+veya paketi kaldırın.
 
-SpringBoard normal açılmıyorsa jailbreak'in tweak yüklemeyi kapatma / güvenli
-mod seçeneğiyle açın, Filza üzerinden kapatma dosyasını oluşturun veya Hacı OS
-paketini kaldırın. Objective-C istisna koruması her tür çökme ve açılış döngüsünü
-önleyemez; bu ilk sürümün cihaz uyumluluğu ayrıca doğrulanmalıdır.
+## Paketleme
 
-`orbit-prototip.html` sonraki aşamanın tasarımıdır; bu sürümde kullanılmaz.
+Mevcut GitHub Actions hattı `main` push veya **Run workflow** ile çalışır;
+`arm64` ve `arm64e` için rootless paket üretir. Artifact adı ve release
+tag/adı sürümü `control` dosyasından alır: `v0.1.0-build.<run_number>`.
+Sabit indirme dosyası `HaciOS-latest.deb` olarak kalır. Kurulumdan sonra respring
+yapın. Önceki sürümün derleme ve telefon doğrulaması bu yeni kodun doğrulaması
+sayılmaz; Aşama 3a değişiklikleri bu düzenleme sırasında derlenmemiş veya
+test edilmemiştir.
+
+Özel SpringBoard API'leri, dock'un aynı ana ekran penceresinde bulunması ve
+`com.apple.springboard.hasBlankedScreen` bildirim durumunun sıfır dışında
+ekran kapalı anlamına gelmesi iOS 16.4.1 cihazında ayrıca doğrulanmalıdır.
+Void dönen bir açma API'sinde günlükteki `accepted`, isteğin iletildiğini belirtir;
+uygulamanın gerçekten açıldığını doğrulamaz.

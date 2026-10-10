@@ -12,14 +12,15 @@
     font-family:-apple-system,"SF Pro Display","Helvetica Neue",Arial,sans-serif; user-select:none; -webkit-user-select:none; }
   #gl { position:fixed; inset:0; width:100%; height:100%; display:block; }
   #stage { position:fixed; inset:0; }
-  .clock { position:absolute; top:max(env(safe-area-inset-top),14px); left:0; right:0; text-align:center; pointer-events:none; }
+  .clock { position:absolute; top:max(env(safe-area-inset-top),14px); left:0; right:0; text-align:center;
+    pointer-events:auto; cursor:pointer; touch-action:manipulation; min-height:60px; padding:8px 0; z-index:2; }
   .clock .t { font-size:15px; letter-spacing:.32em; font-weight:300; text-indent:.32em; opacity:.92; }
   .clock .d { font-size:10px; letter-spacing:.42em; text-indent:.42em; margin-top:6px; opacity:.45; text-transform:uppercase; }
   .orbit { position:absolute; left:0; top:0; width:0; height:0; }
   .app { position:absolute; width:50px; height:50px; margin:-25px 0 0 -25px; border-radius:50%;
     background:radial-gradient(circle at 32% 28%, #1c1c1c 0%, #060606 70%);
     border:1px solid rgba(255,255,255,.55); box-shadow:0 0 0 1px rgba(0,0,0,.9), 0 0 14px rgba(255,255,255,.12), inset 0 0 8px rgba(255,255,255,.06);
-    display:grid; place-items:center; cursor:pointer; transition:transform .18s ease, box-shadow .18s ease; }
+    display:grid; place-items:center; cursor:pointer; touch-action:manipulation; transition:transform .18s ease, box-shadow .18s ease; }
   .app:active { transform:scale(.9); }
   .app.on { box-shadow:0 0 0 1px rgba(0,0,0,.9), 0 0 24px rgba(255,255,255,.55); }
   .app svg { width:25px; height:25px; fill:none; stroke:var(--paper); stroke-width:1.4; stroke-linecap:round; stroke-linejoin:round; }
@@ -29,19 +30,22 @@
   #label.show { opacity:.9; }
   .haci { position:absolute; left:50%; bottom:max(env(safe-area-inset-bottom),22px); transform:translateX(-50%); width:min(78vw,300px); height:44px;
     border-radius:22px; border:1px solid rgba(255,255,255,.35); background:rgba(8,8,8,.55); backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
-    display:flex; align-items:center; gap:10px; padding:0 16px; font-size:12px; letter-spacing:.14em; color:rgba(255,255,255,.62); }
+    display:flex; align-items:center; gap:10px; padding:0 16px; font-size:12px; letter-spacing:.14em; color:rgba(255,255,255,.62);
+    cursor:pointer; touch-action:manipulation; }
   .haci i { width:7px; height:7px; border-radius:50%; background:var(--paper); box-shadow:0 0 10px #fff; animation:pulse 3.2s ease-in-out infinite; }
   @keyframes pulse { 0%,100% { opacity:.4 } 50% { opacity:1 } }
+  body.paused .haci i { animation-play-state:paused; }
+  @media (prefers-reduced-motion:reduce) { .haci i { animation:none; } }
 </style>
 </head>
 <body>
 <canvas id="gl"></canvas>
 <div id="stage">
-  <div class="clock"><div class="t" id="t">--:--</div><div class="d" id="d"></div></div>
+  <div class="clock" role="button" tabindex="0" aria-label="Saate üç kez dokunarak normal ana ekrana dön"><div class="t" id="t">--:--</div><div class="d" id="d"></div></div>
   <div id="rings"></div>
   <div id="orbits"></div>
-  <div id="label"></div>
-  <div class="haci"><i></i><span>Hacı'ya sor</span></div>
+  <div id="label" role="status" aria-live="polite"></div>
+  <div class="haci" role="button" tabindex="0" aria-label="Hacı, yakında"><i></i><span>Hacı'ya sor</span></div>
 </div>
 
 <script id="vs" type="x-shader/x-vertex">
@@ -123,23 +127,33 @@ void main(){
 (function(){
   /* ---------- WebGL kara delik ---------- */
   var cv = document.getElementById('gl');
-  var gl = cv.getContext('webgl', {antialias:false, powerPreference:'low-power'});
+  var gl = null, pr, uRes, uTime, uC;
   var CY = 0.47;                       // delik merkezinin dikey konumu (alttan oran)
   function sh(type, id){ var s=gl.createShader(type); gl.shaderSource(s, document.getElementById(id).textContent); gl.compileShader(s);
-    if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s)); return s; }
-  var pr = gl.createProgram(); gl.attachShader(pr, sh(gl.VERTEX_SHADER,'vs')); gl.attachShader(pr, sh(gl.FRAGMENT_SHADER,'fs')); gl.linkProgram(pr); gl.useProgram(pr);
-  var buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
-  var loc = gl.getAttribLocation(pr,'a'); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc,2,gl.FLOAT,false,0,0);
-  var uRes = gl.getUniformLocation(pr,'uRes'), uTime = gl.getUniformLocation(pr,'uTime'), uC = gl.getUniformLocation(pr,'uC');
+    if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
+  try {
+    gl = cv.getContext('webgl', {antialias:false, powerPreference:'low-power'});
+    if(!gl) throw new Error('WebGL kullanılamıyor');
+    pr = gl.createProgram(); gl.attachShader(pr, sh(gl.VERTEX_SHADER,'vs')); gl.attachShader(pr, sh(gl.FRAGMENT_SHADER,'fs')); gl.linkProgram(pr);
+    if(!gl.getProgramParameter(pr, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(pr));
+    gl.useProgram(pr);
+    var buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+    var loc = gl.getAttribLocation(pr,'a'); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc,2,gl.FLOAT,false,0,0);
+    uRes = gl.getUniformLocation(pr,'uRes'); uTime = gl.getUniformLocation(pr,'uTime'); uC = gl.getUniformLocation(pr,'uC');
+  } catch(error) {
+    console.warn('[HaciOS] WebGL kapalı:', error.message);
+    gl = null; // Saat, kurtarma ve uygulama köprüsü WebGL olmadan da kurulur.
+  }
   var W=0,H=0, dpr=1;
   function resize(){
     dpr = Math.min(window.devicePixelRatio||1, 2);
     W = window.innerWidth; H = window.innerHeight;
     var scale = 0.75;                  // pil ve akıcılık için biraz düşük çözünürlük
     cv.width = Math.round(W*dpr*scale); cv.height = Math.round(H*dpr*scale);
-    gl.viewport(0,0,cv.width,cv.height);
+    if(gl) gl.viewport(0,0,cv.width,cv.height);
     layout();
+    draw(elapsed);
   }
   window.addEventListener('resize', resize);
 
@@ -152,16 +166,16 @@ void main(){
     foto:'<circle cx="12" cy="12" r="8.5"/><path d="M12 3.5v8.5l6-6M20.5 12H12l6 6M12 20.5V12l-6 6M3.5 12H12L6 6"/>',
     not:'<path d="M7 4h8l3 3v13H7z"/><path d="M10 10h5M10 13.5h5M10 17h3"/>',
     mail:'<rect x="4" y="6" width="16" height="12" rx="2"/><path d="M4.5 7.5l7.5 6 7.5-6"/>',
-    harita:'<path d="M12 20s6-5.2 6-10a6 6 0 0 0-12 0c0 4.8 6 10 6 10z"/><circle cx="12" cy="10" r="2.2"/>',
-    muzik:'<path d="M9 17.5V6l9-2v11.5"/><circle cx="7" cy="17.5" r="2.2"/><circle cx="16" cy="15.5" r="2.2"/>',
+    whatsapp:'<path d="M5.3 17.4 4 21l4.2-1.2A8.5 8.5 0 1 0 5.3 17.4z"/><path d="m8 7 1.7-.2 1 2.5-1.1.9a7.5 7.5 0 0 0 3.7 3.7l.9-1.1 2.5 1-.2 1.7c-.2 1-1.2 1.5-2.1 1.3A10 10 0 0 1 6.7 9.1C6.5 8.2 7 7.2 8 7z"/>',
+    dosya:'<path d="M3.5 7A1.5 1.5 0 0 1 5 5.5h4l2 2h8A1.5 1.5 0 0 1 20.5 9v9A1.5 1.5 0 0 1 19 19.5H5A1.5 1.5 0 0 1 3.5 18z"/><path d="M3.5 10h17"/>',
     ayar:'<circle cx="12" cy="12" r="3"/><path d="M12 3.5v2.5M12 18v2.5M3.5 12H6M18 12h2.5M6 6l1.8 1.8M16.2 16.2L18 18M18 6l-1.8 1.8M7.8 16.2L6 18"/>',
     haci:'<path d="M5 19V5M19 19V5M5 12h14"/><circle cx="12" cy="12" r="1.4"/>',
     claude:'<path d="M12 3.5v17M3.5 12h17M6 6l12 12M18 6L6 18"/>'
   };
-  var NAMES = {telefon:'Telefon',mesaj:'Mesajlar',safari:'Safari',kamera:'Kamera',foto:'Fotoğraflar',not:'Notlar',mail:'Mail',harita:'Haritalar',muzik:'Müzik',ayar:'Ayarlar',haci:'Hacı',claude:'Claude'};
+  var NAMES = {telefon:'Telefon',mesaj:'Mesajlar',safari:'Safari',kamera:'Kamera',foto:'Fotoğraflar',not:'Notlar',mail:'Mail',whatsapp:'WhatsApp',dosya:'Dosyalar',ayar:'Ayarlar',haci:'YAKINDA',claude:'Claude'};
   var RINGS = [
     { items:['haci','claude','kamera','safari','mesaj'], speed:.055, dir:1 },
-    { items:['telefon','foto','not','mail','harita','muzik','ayar'], speed:.034, dir:-1 }
+    { items:['telefon','foto','not','mail','whatsapp','dosya','ayar'], speed:.034, dir:-1 }
   ];
   var orbitsEl = document.getElementById('orbits'), ringsEl = document.getElementById('rings'), labelEl = document.getElementById('label');
   var nodes = [], radii = [];
@@ -170,8 +184,10 @@ void main(){
       var rEl = document.createElement('div'); rEl.className='ring'; ringsEl.appendChild(rEl); radii.push(rEl);
       rg.items.forEach(function(key, i){
         var el = document.createElement('div'); el.className='app'; el.dataset.k=key;
+        el.setAttribute('role','button'); el.setAttribute('tabindex','0'); el.setAttribute('aria-label',NAMES[key]);
         el.innerHTML = '<svg viewBox="0 0 24 24">'+ICON[key]+'</svg>';
         el.addEventListener('click', function(){ pick(el, key); });
+        el.addEventListener('keydown', function(event){ if(event.key==='Enter' || event.key===' '){ event.preventDefault(); pick(el,key); } });
         orbitsEl.appendChild(el); nodes.push({el:el, ring:ri, i:i, n:rg.items.length});
       });
     });
@@ -187,35 +203,86 @@ void main(){
     labelEl.style.top = (cy + rad[1] + 40) + 'px';
   }
   var labelTimer=null;
-  function pick(el, key){
-    nodes.forEach(function(n){ n.el.classList.remove('on'); }); el.classList.add('on');
-    labelEl.textContent = NAMES[key]; labelEl.classList.add('show');
-    clearTimeout(labelTimer); labelTimer = setTimeout(function(){ labelEl.classList.remove('show'); el.classList.remove('on'); }, 1600);
-    // Gerçek uygulamada burada yerel köprü çağrılır: bridge.open(key)
-    if(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.open){ window.webkit.messageHandlers.open.postMessage(key); }
+  function post(message){
+    try {
+      var handler = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.hacios;
+      if(handler) handler.postMessage(message);
+    } catch(error) { window.haciToast('Açılamadı'); }
   }
+  window.haciToast = function(text){
+    labelEl.textContent = String(text); labelEl.classList.add('show');
+    clearTimeout(labelTimer); labelTimer = setTimeout(function(){
+      labelEl.classList.remove('show'); nodes.forEach(function(n){ n.el.classList.remove('on'); });
+    }, 1600);
+  };
+  function pick(el, key){
+    nodes.forEach(function(n){ n.el.classList.remove('on'); }); if(el) el.classList.add('on');
+    window.haciToast(NAMES[key]);
+    post({cmd:'open', key:key});
+  }
+  var haciEl = document.querySelector('.haci');
+  haciEl.addEventListener('click', function(){ pick(null,'haci'); });
+  haciEl.addEventListener('keydown', function(event){ if(event.key==='Enter' || event.key===' '){ event.preventDefault(); pick(null,'haci'); } });
 
   /* ---------- Saat ---------- */
   var tEl=document.getElementById('t'), dEl=document.getElementById('d');
   function tick(){ var n=new Date(); tEl.textContent = ('0'+n.getHours()).slice(-2)+':'+('0'+n.getMinutes()).slice(-2);
     dEl.textContent = n.toLocaleDateString('tr-TR',{weekday:'long',day:'numeric',month:'long'}); }
-  tick(); setInterval(tick, 15000);
+  var clockEl = document.querySelector('.clock'), tapCount=0, firstTap=0;
+  function clockTap(){
+    var now=performance.now();
+    if(!tapCount || now-firstTap>1000){ tapCount=0; firstTap=now; }
+    if(++tapCount===3){ tapCount=0; post({cmd:'hide'}); }
+  }
+  clockEl.addEventListener('click', clockTap);
+  clockEl.addEventListener('keydown', function(event){ if(event.key==='Enter' || event.key===' '){ event.preventDefault(); clockTap(); } });
 
   /* ---------- Döngü ---------- */
-  var t0 = performance.now(), reduce = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
-  function frame(now){
-    var t = (now - t0)/1000;
-    gl.uniform2f(uRes, cv.width, cv.height); gl.uniform1f(uTime, reduce ? 0 : t); gl.uniform2f(uC, .5, CY);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var elapsed=0, lastFrame=null, rafID=null, clockID=null;
+  // Native sürüm didFinishNavigation'da görünürlük durumunu bildirene kadar durur.
+  var nativePaused=!!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.hacios);
+  function isPaused(){ return nativePaused || document.hidden; }
+  function draw(t){
+    if(gl){
+      gl.uniform2f(uRes, cv.width, cv.height); gl.uniform1f(uTime, reduce ? 0 : t); gl.uniform2f(uC, .5, CY);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
     nodes.forEach(function(n){
       var rg = RINGS[n.ring];
-      var a = (n.i / n.n) * Math.PI*2 + (n.ring ? Math.PI/ n.n : 0) - Math.PI/2;
+      var a = (n.i / n.n) * Math.PI*2 + (n.ring ? Math.PI/ n.n : 0) - Math.PI/2 + (reduce ? 0 : t*rg.speed*rg.dir);
       var x = cx + Math.cos(a)*rad[n.ring], y = cy + Math.sin(a)*rad[n.ring];
       n.el.style.left = x+'px'; n.el.style.top = y+'px';
     });
-    requestAnimationFrame(frame);
   }
-  build(); resize(); requestAnimationFrame(frame);
+  function frame(now){
+    rafID=null;
+    if(isPaused()) return;
+    if(lastFrame!==null) elapsed += Math.min((now-lastFrame)/1000, .1);
+    lastFrame=now; draw(elapsed);
+    rafID=requestAnimationFrame(frame);
+  }
+  function syncLoop(){
+    var paused=isPaused(); document.body.classList.toggle('paused',paused);
+    if(paused){
+      if(rafID!==null){ cancelAnimationFrame(rafID); rafID=null; }
+      if(clockID!==null){ clearInterval(clockID); clockID=null; }
+      lastFrame=null; tapCount=0;
+      clearTimeout(labelTimer); labelTimer=null; labelEl.classList.remove('show');
+      nodes.forEach(function(n){ n.el.classList.remove('on'); });
+    } else {
+      tick();
+      if(clockID===null) clockID=setInterval(tick,15000);
+      if(!reduce && rafID===null) rafID=requestAnimationFrame(frame);
+      if(reduce) draw(0);
+    }
+  }
+  window.haciPause = function(paused){ nativePaused=!!paused; syncLoop(); };
+  document.addEventListener('visibilitychange',syncLoop);
+  // GPU bağlamı kaybolsa bile kurtarma ve uygulama düğmeleri kullanılabilir.
+  cv.addEventListener('webglcontextlost',function(event){ event.preventDefault(); gl=null; });
+  build(); resize(); tick(); syncLoop();
+  window.haciReady=true;
 })();
 </script>
 </body>

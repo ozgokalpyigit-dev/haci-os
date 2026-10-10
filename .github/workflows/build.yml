@@ -29,6 +29,16 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Paket sürümünü control dosyasından oku
+        run: |
+          set -euo pipefail
+          version=$(awk '$1 == "Version:" { print $2; exit }' control | tr -d '\r')
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "control dosyasındaki Version alanı geçersiz: $version" >&2
+            exit 1
+          fi
+          echo "HACIOS_VERSION=$version" >> "$GITHUB_ENV"
+
       - name: Paketleme ve imzalama araçlarını kur
         run: |
           set -euo pipefail
@@ -87,7 +97,7 @@ jobs:
       - name: Deb dosyalarını artifact olarak yükle
         uses: actions/upload-artifact@v4
         with:
-          name: HaciOS-rootless-${{ github.run_number }}
+          name: HaciOS-${{ env.HACIOS_VERSION }}-rootless-${{ github.run_number }}
           path: |
             packages/*.deb
             dist/HaciOS-latest.deb
@@ -96,9 +106,9 @@ jobs:
       - name: GitHub sürümü ve kalıcı indirme bağlantısını yayımla
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.0.1-build.${{ github.run_number }}
+          tag_name: v${{ env.HACIOS_VERSION }}-build.${{ github.run_number }}
           target_commitish: ${{ github.sha }}
-          name: Hacı OS 0.0.1 — build ${{ github.run_number }}
+          name: Hacı OS ${{ env.HACIOS_VERSION }} — build ${{ github.run_number }}
           draft: false
           prerelease: false
           make_latest: "true"
@@ -107,5 +117,6 @@ jobs:
             packages/*.deb
             dist/HaciOS-latest.deb
           body: |
-            iPhone X / iOS 16.4.1 / Dopamine rootless / ElleKit için ilk hello-world paketi.
+            iPhone X / iOS 16.4.1 / Dopamine rootless / ElleKit için Aşama 3a: Hacı Orbit.
+            Normal ana ekrana dönmek için saate üç kez dokunun; Orbit respring'e kadar gizlenir.
             Kolay kurulum için HaciOS-latest.deb dosyasını indirin.
