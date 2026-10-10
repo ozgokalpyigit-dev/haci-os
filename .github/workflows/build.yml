@@ -17,12 +17,13 @@ jobs:
   build:
     runs-on: macos-15
     timeout-minutes: 30
-    env:
-      THEOS: ${{ runner.temp }}/hacios-theos
     defaults:
       run:
         shell: bash
     steps:
+      - name: Theos yolunu ayarla
+        run: echo "THEOS=$RUNNER_TEMP/hacios-theos" >> "$GITHUB_ENV"
+
       - name: Kaynak dosyalarını al
         uses: actions/checkout@v4
         with:
