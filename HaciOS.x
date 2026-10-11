@@ -68,12 +68,23 @@ static void HaciOSLog(NSString *format, ...) {
                     NSLog(@"[HaciOS] log file open failed: %@", path);
                     return;
                 }
-                unsigned long long size = [handle seekToEndOfFile];
+                unsigned long long size = 0;
+                if (![handle seekToEndReturningOffset:&size error:&error]) {
+                    NSLog(@"[HaciOS] log seek failed: %@", error);
+                    return;
+                }
                 if (size + data.length > 200 * 1024) {
                     // En yeni ~100 KB'yi satır sınırında tut; büyük eski dosyayı bütünüyle okuma.
                     unsigned long long start = size > 100 * 1024 ? size - 100 * 1024 : 0;
-                    [handle seekToFileOffset:start];
-                    NSData *tail = [handle readDataOfLength:100 * 1024];
+                    if (![handle seekToOffset:start error:&error]) {
+                        NSLog(@"[HaciOS] log tail seek failed: %@", error);
+                        return;
+                    }
+                    NSData *tail = [handle readDataUpToLength:100 * 1024 error:&error];
+                    if (!tail) {
+                        NSLog(@"[HaciOS] log tail read failed: %@", error);
+                        return;
+                    }
                     NSUInteger offset = 0;
                     if (start > 0) {
                         const uint8_t *bytes = tail.bytes;
@@ -82,19 +93,29 @@ static void HaciOSLog(NSString *format, ...) {
                     }
                     NSMutableData *trimmed = [[tail subdataWithRange:NSMakeRange(offset, tail.length - offset)] mutableCopy];
                     [trimmed appendData:data];
-                    [handle closeFile];
+                    if (![handle closeAndReturnError:&error]) {
+                        NSLog(@"[HaciOS] log close failed: %@", error);
+                        return;
+                    }
                     handle = nil;
                     if (![trimmed writeToFile:path options:NSDataWritingAtomic error:&error]) {
                         NSLog(@"[HaciOS] log trim failed: %@", error);
                     }
                 } else {
-                    [handle writeData:data];
+                    if (![handle writeData:data error:&error]) {
+                        NSLog(@"[HaciOS] log write failed: %@", error);
+                    }
                 }
             } @catch (NSException *exception) {
                 // Günlük hatasında aynı kuyruğa tekrar günlük ekleyip sonsuz döngü oluşturma.
                 NSLog(@"[HaciOS] file logging failed: %@", exception);
             } @finally {
-                @try { [handle closeFile]; }
+                @try {
+                    NSError *closeError = nil;
+                    if (handle && ![handle closeAndReturnError:&closeError]) {
+                        NSLog(@"[HaciOS] log close failed: %@", closeError);
+                    }
+                }
                 @catch (__unused NSException *exception) {}
             }
         }
@@ -422,11 +443,11 @@ static NSAttributedString *HaciOSText(NSString *text, UIFont *font, CGFloat spac
     CGFloat dx = local.x - CGRectGetMidX(target.bounds), dy = local.y - CGRectGetMidY(target.bounds);
     return dx*dx + dy*dy <= 25*25;
 }
-- (BOOL)beginTracking:(UITouch *)touch withEvent:(UIEvent *)event {
+- (BOOL)beginTracking:(UITouch *)touch withEvent:(__unused UIEvent *)event {
     return [self containsOverlayPoint:[touch locationInView:HaciOSOrbit.overlay]];
 }
-- (BOOL)continueTracking:(UITouch *)touch withEvent:(UIEvent *)event { return YES; }
-- (void)endTracking:(UITouch *)touch withEvent:(UIEvent *)event {
+- (BOOL)continueTracking:(__unused UITouch *)touch withEvent:(__unused UIEvent *)event { return YES; }
+- (void)endTracking:(UITouch *)touch withEvent:(__unused UIEvent *)event {
     // UIControl'un model koordinatlarına dayanan varsayılan touchUpInside hesabını kullanma.
     if (touch && [self containsOverlayPoint:[touch locationInView:HaciOSOrbit.overlay]])
         [self sendActionsForControlEvents:UIControlEventTouchUpInside];
@@ -738,7 +759,7 @@ static NSAttributedString *HaciOSText(NSString *text, UIFont *font, CGFloat spac
     } else {
         [self updateClock];
         __weak HaciOSOverlayView *weakSelf = self;
-        self.clockTimer = [NSTimer timerWithTimeInterval:60 repeats:YES block:^(NSTimer *timer) {
+        self.clockTimer = [NSTimer timerWithTimeInterval:60 repeats:YES block:^(__unused NSTimer *timer) {
             @try { [weakSelf updateClock]; }
             @catch (NSException *exception) { HaciOSErrorOnce(@"clock", exception.name); }
         }];
@@ -754,7 +775,7 @@ static NSAttributedString *HaciOSText(NSString *text, UIFont *font, CGFloat spac
     self.statusLabel.hidden = NO;
     UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, text);
     __weak HaciOSOverlayView *weakSelf = self;
-    self.labelTimer = [NSTimer timerWithTimeInterval:1.6 repeats:NO block:^(NSTimer *timer) {
+    self.labelTimer = [NSTimer timerWithTimeInterval:1.6 repeats:NO block:^(__unused NSTimer *timer) {
         weakSelf.statusLabel.hidden = YES;
         weakSelf.labelTimer = nil;
     }];
@@ -768,11 +789,11 @@ static NSAttributedString *HaciOSText(NSString *text, UIFont *font, CGFloat spac
         [self.coordinator openKey:icon.key];
     } @catch (NSException *exception) { HaciOSErrorOnce(@"pick", exception.name); [self showStatus:@"AÇILAMADI"]; }
 }
-- (void)askHaci:(UIControl *)sender {
+- (void)askHaci:(__unused UIControl *)sender {
     @try { [self.coordinator openKey:@"haci"]; }
     @catch (NSException *exception) { HaciOSErrorOnce(@"capsule", exception.name); }
 }
-- (void)clockTapped:(UITapGestureRecognizer *)gesture {
+- (void)clockTapped:(__unused UITapGestureRecognizer *)gesture {
     @try {
         if (self.hidden) return;
         CFTimeInterval now = CACurrentMediaTime();
@@ -954,23 +975,35 @@ static void HaciOSAttach(id candidate) {
             if (!HaciOSOrbit) HaciOSOrbit = [[HaciOSCoordinator alloc] init];
             [HaciOSOrbit attachToController:controller];
             // Önceden layout olmuş ayrı dock pencereleri de ilk attach'te saklanır.
-            for (UIWindow *window in UIApplication.sharedApplication.windows) HaciOSDiscoverChrome(window);
+            for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+                if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+                UIWindowScene *windowScene = (UIWindowScene *)scene;
+                for (UIWindow *window in windowScene.windows) HaciOSDiscoverChrome(window);
+            }
         } @catch (NSException *exception) { HaciOSErrorOnce(@"attach dispatch", exception.name); }
     });
 }
 
+// Logos ifadelerini ayrı satırda tut; aynı satırdaki blok kapanışları kapsam takibini bozabilir.
 %group HaciOSHome
 %hook HaciOSHomeController
 - (void)viewDidLoad {
-    @try { %orig; HaciOSAttach(self); }
+    @try {
+        %orig;
+        HaciOSAttach(self);
+    }
     @catch (NSException *exception) { HaciOSErrorOnce(@"home load", exception.name); }
 }
 - (void)viewDidAppear:(BOOL)animated {
-    @try { %orig; HaciOSAttach(self); }
+    @try {
+        %orig;
+        HaciOSAttach(self);
+    }
     @catch (NSException *exception) { HaciOSErrorOnce(@"home appear", exception.name); }
 }
 - (void)viewWillDisappear:(BOOL)animated {
-    @try { %orig;
+    @try {
+        %orig;
         if (HaciOSOrbit.owner == (id)self) { HaciOSOrbit.ownerVisible = NO; [HaciOSOrbit refreshVisibility]; }
     } @catch (NSException *exception) { HaciOSErrorOnce(@"home disappear", exception.name); }
 }
@@ -996,11 +1029,17 @@ static void HaciOSAttach(id candidate) {
 %group HaciOSHomeWindow
 %hook HaciOSHomeScreenWindow
 - (void)setHidden:(BOOL)hidden {
-    @try { %orig; [HaciOSOrbit refreshVisibility]; }
+    @try {
+        %orig;
+        [HaciOSOrbit refreshVisibility];
+    }
     @catch (NSException *exception) { HaciOSErrorOnce(@"home window hidden", exception.name); }
 }
 - (void)layoutSubviews {
-    @try { %orig; [HaciOSOrbit refreshVisibility]; }
+    @try {
+        %orig;
+        [HaciOSOrbit refreshVisibility];
+    }
     @catch (NSException *exception) { HaciOSErrorOnce(@"home window layout", exception.name); }
 }
 %end
@@ -1009,11 +1048,17 @@ static void HaciOSAttach(id candidate) {
 %group HaciOSDock
 %hook HaciOSDockView
 - (void)layoutSubviews {
-    @try { %orig; HaciOSApplyChrome((UIView *)self); }
+    @try {
+        %orig;
+        HaciOSApplyChrome((UIView *)self);
+    }
     @catch (NSException *exception) { HaciOSErrorOnce(@"dock layout", exception.name); }
 }
 - (void)didMoveToWindow {
-    @try { %orig; HaciOSApplyChrome((UIView *)self); }
+    @try {
+        %orig;
+        HaciOSApplyChrome((UIView *)self);
+    }
     @catch (NSException *exception) { HaciOSErrorOnce(@"dock window", exception.name); }
 }
 - (void)setAlpha:(CGFloat)alpha {
@@ -1051,11 +1096,17 @@ static void HaciOSAttach(id candidate) {
 %group HaciOSFloatingDock
 %hook HaciOSFloatingDockView
 - (void)layoutSubviews {
-    @try { %orig; HaciOSApplyChrome((UIView *)self); }
+    @try {
+        %orig;
+        HaciOSApplyChrome((UIView *)self);
+    }
     @catch (NSException *exception) { HaciOSErrorOnce(@"floating dock layout", exception.name); }
 }
 - (void)didMoveToWindow {
-    @try { %orig; HaciOSApplyChrome((UIView *)self); }
+    @try {
+        %orig;
+        HaciOSApplyChrome((UIView *)self);
+    }
     @catch (NSException *exception) { HaciOSErrorOnce(@"floating dock window", exception.name); }
 }
 - (void)setAlpha:(CGFloat)alpha {
@@ -1093,11 +1144,17 @@ static void HaciOSAttach(id candidate) {
 %group HaciOSPageControl
 %hook HaciOSIconListPageControl
 - (void)layoutSubviews {
-    @try { %orig; HaciOSApplyChrome((UIView *)self); }
+    @try {
+        %orig;
+        HaciOSApplyChrome((UIView *)self);
+    }
     @catch (NSException *exception) { HaciOSErrorOnce(@"page layout", exception.name); }
 }
 - (void)didMoveToWindow {
-    @try { %orig; HaciOSApplyChrome((UIView *)self); }
+    @try {
+        %orig;
+        HaciOSApplyChrome((UIView *)self);
+    }
     @catch (NSException *exception) { HaciOSErrorOnce(@"page window", exception.name); }
 }
 - (void)setAlpha:(CGFloat)alpha {
@@ -1169,11 +1226,17 @@ static BOOL HaciOSCanHookChrome(Class cls) {
             } else HaciOSReadBlankState(HaciOSBlankToken);
             // Her özel sınıf ayrı grupta; bulunmayan dock/page sınıfı sessizce atlanır.
             Class dockClass = objc_getClass("SBDockView");
-            if (HaciOSCanHookChrome(dockClass)) { %init(HaciOSDock, HaciOSDockView = dockClass); }
+            if (HaciOSCanHookChrome(dockClass)) {
+                %init(HaciOSDock, HaciOSDockView = dockClass);
+            }
             Class floatingClass = objc_getClass("SBFloatingDockView");
-            if (HaciOSCanHookChrome(floatingClass)) { %init(HaciOSFloatingDock, HaciOSFloatingDockView = floatingClass); }
+            if (HaciOSCanHookChrome(floatingClass)) {
+                %init(HaciOSFloatingDock, HaciOSFloatingDockView = floatingClass);
+            }
             Class pageClass = objc_getClass("SBIconListPageControl");
-            if (HaciOSCanHookChrome(pageClass)) { %init(HaciOSPageControl, HaciOSIconListPageControl = pageClass); }
+            if (HaciOSCanHookChrome(pageClass)) {
+                %init(HaciOSPageControl, HaciOSIconListPageControl = pageClass);
+            }
             if (class_getInstanceMethod(homeWindow, @selector(setHidden:)) && class_getInstanceMethod(homeWindow, @selector(layoutSubviews))) {
                 %init(HaciOSHomeWindow, HaciOSHomeScreenWindow = homeWindow);
             }
