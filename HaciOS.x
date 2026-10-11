@@ -249,13 +249,18 @@ static BOOL HaciOSContainsPoint(UIView *view, UIView *overlay, CGPoint point, BO
 @property (nonatomic, assign) BOOL refreshing;
 @property (nonatomic, assign) BOOL attaching;
 @property (nonatomic, assign) BOOL hasVisibilityState;
-@property (nonatomic, assign) BOOL lastVisible;
+@property (nonatomic, assign) BOOL lastShown;
 @property (nonatomic, assign) BOOL lastPaused;
 - (void)attachToController:(UIViewController *)controller;
 - (void)refreshVisibility;
 - (void)openKey:(NSString *)key;
 - (void)hideUntilRespring;
 @end
+static BOOL HaciOSShouldShowOverlay(HaciOSOverlayView *overlay) {
+    // Uygulama/ekran/owner görünürlüğü yalnız pause içindir; Orbit bağlıyken
+    // kapanış animasyonunun altındaki stok ikonları ve dock'u açığa çıkarma.
+    return overlay.superview && !HaciOSHiddenUntilRespring && !HaciOSIsDisabled();
+}
 // performSelector nesne argümanları alır; suspended: BOOL için NSInvocation kullan.
 // Özel API'nin void/BOOL dönüşünü çalışma anındaki imzadan oku.
 static BOOL HaciOSInvokeLaunch(id target, SEL selector, NSString *bundleID, BOOL suspendedArgument) {
@@ -929,21 +934,20 @@ static NSAttributedString *HaciOSText(NSString *text, UIFont *font, CGFloat spac
     if (self.refreshing || self.attaching || !self.overlay) return;
     self.refreshing = YES;
     @try {
-        BOOL visible = self.overlay.superview && self.ownerVisible && HaciOSFrontIsHome &&
-            !HaciOSHiddenUntilRespring && !HaciOSIsDisabled() && HaciOSViewIsVisible(self.owner.viewIfLoaded) &&
-            HaciOSViewIsVisible(self.overlay.superview) && HaciOSScreenIsOn();
-        // Görünür Orbit daima çalışır; ayrı, eski bir blank-state veto'su yok.
-        BOOL paused = !visible;
-        self.overlay.hidden = !visible;
-        if (visible && self.overlay.superview.subviews.lastObject != self.overlay)
+        BOOL shown = HaciOSShouldShowOverlay(self.overlay);
+        BOOL paused = !shown || !self.ownerVisible || !HaciOSFrontIsHome ||
+            !HaciOSViewIsVisible(self.owner.viewIfLoaded) ||
+            !HaciOSViewIsVisible(self.overlay.superview) || !HaciOSScreenIsOn();
+        self.overlay.hidden = !shown;
+        if (shown && self.overlay.superview.subviews.lastObject != self.overlay)
             [self.overlay.superview bringSubviewToFront:self.overlay];
         [self.overlay setScenePaused:paused];
         HaciOSRefreshChrome();
         HaciOSRefreshScrollViews();
-        BOOL changed = !self.hasVisibilityState || self.lastVisible != visible || self.lastPaused != self.overlay.paused;
-        if (changed) HaciOSLog(@"visibility: visible=%d paused=%d", visible, self.overlay.paused);
+        BOOL changed = !self.hasVisibilityState || self.lastShown != shown || self.lastPaused != self.overlay.paused;
+        if (changed) HaciOSLog(@"visibility: shown=%d paused=%d", shown, self.overlay.paused);
         self.hasVisibilityState = YES;
-        self.lastVisible = visible;
+        self.lastShown = shown;
         self.lastPaused = self.overlay.paused;
     } @catch (NSException *exception) {
         HaciOSHiddenUntilRespring = YES; // Hata halinde stok ana ekranı serbest bırak.
@@ -951,9 +955,9 @@ static NSAttributedString *HaciOSText(NSString *text, UIFont *font, CGFloat spac
         [self.overlay setScenePaused:YES];
         HaciOSRefreshChrome();
         HaciOSRefreshScrollViews();
-        if (!self.hasVisibilityState || self.lastVisible || !self.lastPaused)
-            HaciOSLog(@"visibility: visible=0 paused=1");
-        self.hasVisibilityState = YES; self.lastVisible = NO; self.lastPaused = YES;
+        if (!self.hasVisibilityState || self.lastShown || !self.lastPaused)
+            HaciOSLog(@"visibility: shown=0 paused=1");
+        self.hasVisibilityState = YES; self.lastShown = NO; self.lastPaused = YES;
         HaciOSErrorOnce(@"visibility", exception.name);
     } @finally { self.refreshing = NO; }
 }
@@ -1013,8 +1017,7 @@ static HaciOSChromeState *HaciOSStateForChrome(UIView *view) {
     return objc_getAssociatedObject(view, &HaciOSChromeStateKey);
 }
 static BOOL HaciOSShouldHideChrome(void) {
-    return HaciOSOrbit.overlay && !HaciOSOrbit.overlay.hidden && HaciOSFrontIsHome &&
-        HaciOSOrbit.ownerVisible && !HaciOSHiddenUntilRespring && !HaciOSIsDisabled();
+    return HaciOSShouldShowOverlay(HaciOSOrbit.overlay);
 }
 @interface HaciOSScrollState : NSObject
 @property (nonatomic, assign) BOOL enabled;
@@ -1128,6 +1131,20 @@ static void HaciOSAttach(id candidate) {
     }
     @catch (NSException *exception) { HaciOSErrorOnce(@"home load", exception.name); }
 }
+- (void)viewWillAppear:(BOOL)animated {
+    @try {
+        %orig;
+        // frontDisplayDidChange:nil kapanış animasyonundan sonra gelebilir.
+        // Bağlı Orbit'i geçiş başında yenile; yeniden attach döngüsünü bekleme.
+        HaciOSFrontIsHome = YES;
+        if (HaciOSOrbit.owner == (id)self) {
+            HaciOSOrbit.ownerVisible = YES;
+            [HaciOSOrbit refreshVisibility];
+        }
+        HaciOSAttach(self);
+    }
+    @catch (NSException *exception) { HaciOSErrorOnce(@"home will appear", exception.name); }
+}
 - (void)viewDidAppear:(BOOL)animated {
     @try {
         %orig;
@@ -1150,10 +1167,12 @@ static void HaciOSAttach(id candidate) {
     @try {
         %orig;
         BOOL home = display == nil;
-        dispatch_async(dispatch_get_main_queue(), ^{
+        dispatch_block_t refresh = ^{
             @try { HaciOSFrontIsHome = home; [HaciOSOrbit refreshVisibility]; }
             @catch (NSException *exception) { HaciOSErrorOnce(@"front display", exception.name); }
-        });
+        };
+        if ([NSThread isMainThread]) refresh();
+        else dispatch_async(dispatch_get_main_queue(), refresh);
     } @catch (NSException *exception) { HaciOSErrorOnce(@"front display hook", exception.name); }
 }
 %end
@@ -1366,7 +1385,8 @@ static void HaciOSAttach(id candidate) {
 
 static BOOL HaciOSCanHookHome(Class cls) {
     return cls && [cls isSubclassOfClass:[UIViewController class]] &&
-        class_getInstanceMethod(cls, @selector(viewDidLoad)) && class_getInstanceMethod(cls, @selector(viewDidAppear:)) &&
+        class_getInstanceMethod(cls, @selector(viewDidLoad)) && class_getInstanceMethod(cls, @selector(viewWillAppear:)) &&
+        class_getInstanceMethod(cls, @selector(viewDidAppear:)) &&
         class_getInstanceMethod(cls, @selector(viewWillDisappear:));
 }
 static BOOL HaciOSCanHookChrome(Class cls) {
@@ -1378,7 +1398,7 @@ static BOOL HaciOSCanHookChrome(Class cls) {
 %ctor {
     @autoreleasepool {
         @try {
-            HaciOSLog(@"initializing 0.2.1: native Orbit");
+            HaciOSLog(@"initializing 0.2.2: native Orbit");
             if (HaciOSIsDisabled()) return;
             Class homeClass = objc_getClass("SBHomeScreenViewController");
             if (!HaciOSCanHookHome(homeClass)) homeClass = objc_getClass("SBIconController");
