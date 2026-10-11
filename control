@@ -1,8 +1,8 @@
 Package: com.yigit.hacios
 Name: Hacı OS
-Version: 0.1.1
+Version: 0.2.0
 Architecture: iphoneos-arm64
-Description: Ana ekranda tam ekran Hacı Orbit arayüzü sunar (Aşama 3a).
+Description: UIKit ve Core Animation ile yerel Hacı Orbit ana ekran arayüzü sunar.
 Maintainer: Yigit
 Author: Yigit
 Section: Tweaks

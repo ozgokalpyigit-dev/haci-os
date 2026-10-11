@@ -1,6 +1,8 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <WebKit/WebKit.h>
+#import <QuartzCore/QuartzCore.h>
+#import <CoreGraphics/CoreGraphics.h>
+#import <math.h>
 #import <dispatch/dispatch.h>
 #import <objc/runtime.h>
 #import <notify.h>
@@ -99,73 +101,102 @@ static void HaciOSLog(NSString *format, ...) {
     });
 }
 
-@class HaciOSCoordinator;
+// Tekrarlayan layout/özel API hataları günlüğü veya pili tüketmesin.
+static void HaciOSErrorOnce(NSString *scope, NSString *detail) {
+    static NSMutableSet<NSString *> *reported;
+    @synchronized ([NSProcessInfo class]) {
+        if (!reported) reported = [NSMutableSet set];
+        if ([reported containsObject:scope]) return;
+        [reported addObject:scope];
+    }
+    HaciOSLog(@"error %@: %@", scope, detail);
+}
+
+@class HaciOSCoordinator, HaciOSOverlayView;
 static HaciOSCoordinator *HaciOSOrbit;
 static BOOL HaciOSHiddenUntilRespring = NO;
-// İlk frontDisplayDidChange gelene kadar home varsayılır; owner/view görünürlüğü ayrıca denetlenir.
 static BOOL HaciOSFrontIsHome = YES;
 static BOOL HaciOSScreenBlanked = NO;
 static int HaciOSBlankToken = -1;
-
-static void HaciOSReadBlankState(int token, NSString *source) {
-    uint64_t state = 0;
-    uint32_t status = notify_get_state(token, &state);
-    // Özel hasBlankedScreen için beklenen durum: 0 = açık, 1 = ekran kapalı.
-    // Cihazda doğrulanması gereken bu değer yalnız duraklatmayı etkiler, overlay'i gizlemez.
-    // Okuma hatası/başka değer pil için temkinli biçimde duraklatır ve ham değer loglanır.
-    HaciOSScreenBlanked = status != NOTIFY_STATUS_OK || state != 0;
-    HaciOSLog(@"blank screen %@: status=%u rawState=%llu ScreenBlanked=%d (pause only; expected 0=on, 1=blanked)",
-              source, status, (unsigned long long)state, HaciOSScreenBlanked);
-    if (status == NOTIFY_STATUS_OK && state > 1) {
-        HaciOSLog(@"unexpected blank screen state=%llu; treating as paused only", (unsigned long long)state);
-    }
-}
+static NSHashTable<UIView *> *HaciOSChromeViews;
+static void HaciOSRefreshChrome(void);
 
 static BOOL HaciOSIsDisabled(void) {
     @try {
-        // 0.0.1'deki kurtarma dosyasının yerini koru.
+        // Dosya ve klasör aynı kurtarma işaretidir; isDirectory filtresi kullanma.
         return [[NSFileManager defaultManager] fileExistsAtPath:
                 ROOT_PATH_NS(@"/var/mobile/Library/Preferences/com.yigit.hacios.disabled")];
     } @catch (NSException *exception) {
-        HaciOSLog(@"disabled check failed: %@", exception.name);
+        HaciOSErrorOnce(@"disabled", exception.name);
         return YES;
     }
 }
 
-@interface HaciOSMessageHandler : NSObject <WKScriptMessageHandler>
-@property (nonatomic, weak) HaciOSCoordinator *coordinator;
+static void HaciOSReadBlankState(int token) {
+    uint64_t state = 0;
+    uint32_t status = notify_get_state(token, &state);
+    // Mevcut davranış: 0 açık; başka değer/hata animasyonu duraklatır.
+    HaciOSScreenBlanked = status != NOTIFY_STATUS_OK || state != 0;
+    if (status != NOTIFY_STATUS_OK || state > 1)
+        HaciOSErrorOnce(@"blank state", [NSString stringWithFormat:@"status=%u state=%llu", status, (unsigned long long)state]);
+}
+
+static BOOL HaciOSViewIsVisible(UIView *view) {
+    if (!view || !view.window || view.window.hidden) return NO;
+    for (UIView *ancestor = view; ancestor; ancestor = ancestor.superview)
+        if (ancestor.hidden || ancestor.alpha <= 0.01) return NO;
+    return YES;
+}
+
+@interface HaciOSIconControl : UIControl
+@property (nonatomic, copy) NSString *key;
+@property (nonatomic, strong) CAGradientLayer *surface;
+@property (nonatomic, strong) CAShapeLayer *glyph;
+- (instancetype)initWithKey:(NSString *)key name:(NSString *)name;
+- (BOOL)containsOverlayPoint:(CGPoint)point;
+- (void)flash;
 @end
 
 @interface HaciOSOverlayView : UIView
 @property (nonatomic, weak) HaciOSCoordinator *coordinator;
+@property (nonatomic, strong) UIView *scene;
+@property (nonatomic, strong) UIView *hole;
+@property (nonatomic, strong) NSArray<UIView *> *orbits;
+@property (nonatomic, strong) NSArray<NSArray<HaciOSIconControl *> *> *icons;
+@property (nonatomic, strong) NSArray<CAShapeLayer *> *rings;
+@property (nonatomic, strong) NSArray<CAGradientLayer *> *disks;
+@property (nonatomic, strong) CAGradientLayer *halo;
+@property (nonatomic, strong) CAGradientLayer *photon;
+@property (nonatomic, strong) CAShapeLayer *photonMask;
+@property (nonatomic, strong) CAShapeLayer *horizon;
+@property (nonatomic, strong) UIView *clock;
+@property (nonatomic, strong) UILabel *timeLabel;
+@property (nonatomic, strong) UILabel *dateLabel;
+@property (nonatomic, strong) UILabel *statusLabel;
+@property (nonatomic, strong) UIControl *capsule;
+@property (nonatomic, strong) CALayer *pulse;
+@property (nonatomic, strong) NSTimer *clockTimer;
+@property (nonatomic, strong) NSTimer *labelTimer;
+@property (nonatomic, strong) NSDateFormatter *timeFormatter;
+@property (nonatomic, strong) NSDateFormatter *dateFormatter;
+@property (nonatomic, assign) BOOL paused;
+@property (nonatomic, assign) NSUInteger clockTapCount;
+@property (nonatomic, assign) CFTimeInterval firstClockTap;
+- (void)updateClock;
+- (void)setScenePaused:(BOOL)paused;
+- (void)showStatus:(NSString *)text;
 @end
 
-@interface HaciOSCoordinator : NSObject <WKNavigationDelegate>
+@interface HaciOSCoordinator : NSObject
 @property (nonatomic, strong) HaciOSOverlayView *overlay;
-@property (nonatomic, strong) WKWebView *webView;
 @property (nonatomic, weak) UIViewController *owner;
 @property (nonatomic, assign) BOOL ownerVisible;
-@property (nonatomic, assign) BOOL pageReady;
-@property (nonatomic, assign) BOOL pageReadyTimedOut;
-@property (nonatomic, assign) BOOL paused;
-@property (nonatomic, assign) NSUInteger loadGeneration;
-@property (nonatomic, strong) WKNavigation *currentNavigation;
-- (void)loadOrbitHTML;
+@property (nonatomic, assign) BOOL refreshing;
 - (void)attachToController:(UIViewController *)controller;
 - (void)refreshVisibility;
-- (void)syncPause:(BOOL)force;
-- (void)handleMessage:(WKScriptMessage *)message;
-- (void)toast:(NSString *)text;
+- (void)openKey:(NSString *)key;
+- (void)hideUntilRespring;
 @end
-
-static BOOL HaciOSViewIsVisible(UIView *view) {
-    if (!view || !view.window || view.window.hidden) return NO;
-    for (UIView *ancestor = view; ancestor; ancestor = ancestor.superview) {
-        if (ancestor.hidden || ancestor.alpha <= 0.01) return NO;
-    }
-    return YES;
-}
-
 // performSelector nesne argümanları alır; suspended: BOOL için NSInvocation kullan.
 // Özel API'nin void/BOOL dönüşünü çalışma anındaki imzadan oku.
 static BOOL HaciOSInvokeLaunch(id target, SEL selector, NSString *bundleID, BOOL suspendedArgument) {
@@ -223,249 +254,621 @@ static BOOL HaciOSLaunchBundle(NSString *bundleID) {
     return opened;
 }
 
-@implementation HaciOSMessageHandler
-- (void)userContentController:(WKUserContentController *)controller didReceiveScriptMessage:(WKScriptMessage *)message {
-    @try {
-        HaciOSCoordinator *coordinator = self.coordinator;
-        if (!coordinator || !message.frameInfo.isMainFrame || ![message.name isEqualToString:@"hacios"]) return;
-        [coordinator handleMessage:message];
-    } @catch (NSException *exception) {
-        HaciOSLog(@"bridge failed: %@", exception.name);
+// SVG A komutunu eliptik yaydan kübik Bezier parçalarına çevirir (en çok 90°).
+static void HaciOSArc(UIBezierPath *path, CGPoint from, CGPoint to, CGFloat rx, CGFloat ry,
+                      CGFloat degrees, BOOL large, BOOL sweep) {
+    rx = fabs(rx); ry = fabs(ry);
+    if (CGPointEqualToPoint(from, to)) return;
+    if (rx == 0 || ry == 0) { [path addLineToPoint:to]; return; }
+    double phi = degrees * M_PI / 180.0, c = cos(phi), s = sin(phi);
+    double dx = (from.x - to.x) / 2.0, dy = (from.y - to.y) / 2.0;
+    double x = c * dx + s * dy, y = -s * dx + c * dy;
+    double scale = x*x/(rx*rx) + y*y/(ry*ry);
+    if (scale > 1) { rx *= sqrt(scale); ry *= sqrt(scale); }
+    double denominator = rx*rx*y*y + ry*ry*x*x;
+    double factor = denominator > 0 ? sqrt(fmax(0, (rx*rx*ry*ry - denominator) / denominator)) : 0;
+    if (large == sweep) factor = -factor;
+    double cxp = factor * rx * y / ry, cyp = -factor * ry * x / rx;
+    double cx = c * cxp - s * cyp + (from.x + to.x)/2.0;
+    double cy = s * cxp + c * cyp + (from.y + to.y)/2.0;
+    double ux = (x-cxp)/rx, uy = (y-cyp)/ry, vx = (-x-cxp)/rx, vy = (-y-cyp)/ry;
+    double start = atan2(uy, ux), delta = atan2(ux*vy-uy*vx, ux*vx+uy*vy);
+    if (!sweep && delta > 0) delta -= 2*M_PI;
+    if (sweep && delta < 0) delta += 2*M_PI;
+    NSInteger pieces = MAX(1, (NSInteger)ceil(fabs(delta)/(M_PI/2.0)));
+    double step = delta / pieces;
+    for (NSInteger i = 0; i < pieces; i++) {
+        double a = start+i*step, b = a+step, k = 4.0/3.0*tan(step/4.0);
+        CGPoint p1 = CGPointMake(cx+rx*c*cos(a)-ry*s*sin(a), cy+rx*s*cos(a)+ry*c*sin(a));
+        CGPoint p2 = CGPointMake(cx+rx*c*cos(b)-ry*s*sin(b), cy+rx*s*cos(b)+ry*c*sin(b));
+        CGPoint v1 = CGPointMake(-rx*c*sin(a)-ry*s*cos(a), -rx*s*sin(a)+ry*c*cos(a));
+        CGPoint v2 = CGPointMake(-rx*c*sin(b)-ry*s*cos(b), -rx*s*sin(b)+ry*c*cos(b));
+        [path addCurveToPoint:i == pieces-1 ? to : p2
+               controlPoint1:CGPointMake(p1.x+k*v1.x, p1.y+k*v1.y)
+               controlPoint2:CGPointMake(p2.x-k*v2.x, p2.y-k*v2.y)];
     }
 }
-@end
 
+// Prototipteki M/L/H/V/A/C/Z yolları; 24×24 koordinatları aynen korunur.
+static UIBezierPath *HaciOSSVGPath(NSString *data) {
+    UIBezierPath *path = [UIBezierPath bezierPath];
+    NSScanner *scanner = [NSScanner scannerWithString:data];
+    scanner.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    scanner.charactersToBeSkipped = [NSCharacterSet characterSetWithCharactersInString:@" ,\t\r\n"];
+    NSCharacterSet *commands = [NSCharacterSet characterSetWithCharactersInString:@"MmLlHhVvAaCcZz"];
+    unichar command = 0;
+    CGPoint current = CGPointZero, start = CGPointZero;
+    while (!scanner.isAtEnd) {
+        NSString *token = nil;
+        if ([scanner scanCharactersFromSet:commands intoString:&token]) command = [token characterAtIndex:0];
+        BOOL relative = command >= 'a' && command <= 'z';
+        unichar op = relative ? command - ('a'-'A') : command;
+        if (op == 'Z') { [path closePath]; current = start; command = 0; continue; }
+        NSUInteger count = op == 'A' ? 7 : op == 'C' ? 6 : (op == 'H' || op == 'V') ? 1 : 2;
+        double n[7] = {0};
+        if (op != 'M' && op != 'L' && op != 'H' && op != 'V' && op != 'A' && op != 'C')
+            [NSException raise:@"HaciOSSVG" format:@"Unsupported path command"];
+        for (NSUInteger i = 0; i < count; i++)
+            if (![scanner scanDouble:&n[i]]) [NSException raise:@"HaciOSSVG" format:@"Incomplete path"];
+        CGPoint base = relative ? current : CGPointZero;
+        CGPoint next = CGPointMake(base.x+n[0], base.y+n[1]);
+        if (op == 'M') {
+            [path moveToPoint:next]; start = next; command = relative ? 'l' : 'L';
+        } else if (op == 'L') [path addLineToPoint:next];
+        else if (op == 'H') { next = CGPointMake(base.x+n[0], current.y); [path addLineToPoint:next]; }
+        else if (op == 'V') { next = CGPointMake(current.x, base.y+n[0]); [path addLineToPoint:next]; }
+        else if (op == 'C') {
+            next = CGPointMake(base.x+n[4], base.y+n[5]);
+            [path addCurveToPoint:next controlPoint1:CGPointMake(base.x+n[0], base.y+n[1])
+                   controlPoint2:CGPointMake(base.x+n[2], base.y+n[3])];
+        } else if (op == 'A') {
+            next = CGPointMake(base.x+n[5], base.y+n[6]);
+            HaciOSArc(path, current, next, n[0], n[1], n[2], n[3] != 0, n[4] != 0);
+        }
+        current = next;
+    }
+    return path;
+}
+
+static UIBezierPath *HaciOSGlyph(NSString *key) {
+    NSDictionary *paths = @{
+        @"telefon": @"M6 4h3l1.5 4-2 1.3a10 10 0 0 0 5.2 5.2L15 12.5l4 1.5v3a2 2 0 0 1-2 2A13 13 0 0 1 4 6a2 2 0 0 1 2-2z",
+        @"mesaj": @"M4 6.5A2.5 2.5 0 0 1 6.5 4h11A2.5 2.5 0 0 1 20 6.5v7a2.5 2.5 0 0 1-2.5 2.5H10l-4 3.5V16h-.0A2.5 2.5 0 0 1 4 13.5z",
+        @"safari": @"M15.8 8.2l-2.2 5.4-5.4 2.2 2.2-5.4z",
+        @"kamera": @"M4 8.5A1.5 1.5 0 0 1 5.5 7H8l1.2-2h5.6L16 7h2.5A1.5 1.5 0 0 1 20 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 17.5z",
+        @"foto": @"M12 3.5v8.5l6-6M20.5 12H12l6 6M12 20.5V12l-6 6M3.5 12H12L6 6",
+        @"not": @"M7 4h8l3 3v13H7z M10 10h5M10 13.5h5M10 17h3",
+        @"mail": @"M4.5 7.5l7.5 6 7.5-6",
+        @"whatsapp": @"M5.3 17.4 4 21l4.2-1.2A8.5 8.5 0 1 0 5.3 17.4z m8 7 1.7-.2 1 2.5-1.1.9a7.5 7.5 0 0 0 3.7 3.7l.9-1.1 2.5 1-.2 1.7c-.2 1-1.2 1.5-2.1 1.3A10 10 0 0 1 6.7 9.1C6.5 8.2 7 7.2 8 7z",
+        @"dosya": @"M3.5 7A1.5 1.5 0 0 1 5 5.5h4l2 2h8A1.5 1.5 0 0 1 20.5 9v9A1.5 1.5 0 0 1 19 19.5H5A1.5 1.5 0 0 1 3.5 18z M3.5 10h17",
+        @"ayar": @"M12 3.5v2.5M12 18v2.5M3.5 12H6M18 12h2.5M6 6l1.8 1.8M16.2 16.2L18 18M18 6l-1.8 1.8M7.8 16.2L6 18",
+        @"haci": @"M5 19V5M19 19V5M5 12h14",
+        @"claude": @"M12 3.5v17M3.5 12h17M6 6l12 12M18 6L6 18"
+    };
+    UIBezierPath *path = HaciOSSVGPath(paths[key]);
+    if ([key isEqualToString:@"safari"] || [key isEqualToString:@"foto"])
+        [path appendPath:[UIBezierPath bezierPathWithOvalInRect:CGRectMake(3.5, 3.5, 17, 17)]];
+    if ([key isEqualToString:@"kamera"])
+        [path appendPath:[UIBezierPath bezierPathWithOvalInRect:CGRectMake(8.6, 9.6, 6.8, 6.8)]];
+    if ([key isEqualToString:@"ayar"])
+        [path appendPath:[UIBezierPath bezierPathWithOvalInRect:CGRectMake(9, 9, 6, 6)]];
+    if ([key isEqualToString:@"haci"])
+        [path appendPath:[UIBezierPath bezierPathWithOvalInRect:CGRectMake(10.6, 10.6, 2.8, 2.8)]];
+    if ([key isEqualToString:@"mail"])
+        [path appendPath:[UIBezierPath bezierPathWithRoundedRect:CGRectMake(4, 6, 16, 12) cornerRadius:2]];
+    return path;
+}
+
+static UIColor *HaciOSWhite(CGFloat alpha) { return [UIColor colorWithWhite:1 alpha:alpha]; }
+static void HaciOSRotate(CALayer *layer, CFTimeInterval duration, CGFloat direction, CFTimeInterval epoch) {
+    CABasicAnimation *rotation = [CABasicAnimation animationWithKeyPath:@"transform.rotation.z"];
+    rotation.fromValue = @0;
+    rotation.toValue = @(direction * 2 * M_PI);
+    rotation.duration = duration;
+    rotation.repeatCount = HUGE_VALF;
+    rotation.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionLinear];
+    // Parent ve ikon ters dönüşleri aynı yerel başlangıcı kullanır; faz kayması olmaz.
+    rotation.beginTime = epoch;
+    [layer addAnimation:rotation forKey:@"orbit.rotation"];
+}
+static NSAttributedString *HaciOSText(NSString *text, UIFont *font, CGFloat spacing, CGFloat alpha) {
+    return [[NSAttributedString alloc] initWithString:text attributes:@{
+        NSFontAttributeName: font, NSKernAttributeName: @(spacing), NSForegroundColorAttributeName: HaciOSWhite(alpha)
+    }];
+}
+
+@implementation HaciOSIconControl
+- (instancetype)initWithKey:(NSString *)key name:(NSString *)name {
+    if ((self = [super initWithFrame:CGRectMake(0, 0, 50, 50)])) {
+        self.key = key;
+        self.accessibilityLabel = name;
+        self.accessibilityTraits = UIAccessibilityTraitButton;
+        self.isAccessibilityElement = YES;
+        self.layer.cornerRadius = 25;
+        self.layer.borderWidth = 1;
+        self.layer.borderColor = HaciOSWhite(.55).CGColor;
+        self.layer.shadowColor = UIColor.whiteColor.CGColor;
+        self.layer.shadowOpacity = .12;
+        self.layer.shadowRadius = 7;
+        self.layer.shadowOffset = CGSizeZero;
+        self.layer.shadowPath = [UIBezierPath bezierPathWithOvalInRect:self.bounds].CGPath;
+        self.surface = [CAGradientLayer layer];
+        self.surface.type = kCAGradientLayerRadial;
+        self.surface.colors = @[(id)[UIColor colorWithWhite:.11 alpha:1].CGColor, (id)[UIColor colorWithWhite:.024 alpha:1].CGColor];
+        self.surface.locations = @[@0, @1];
+        self.surface.startPoint = CGPointMake(.32, .28);
+        self.surface.endPoint = CGPointMake(1, 1);
+        self.surface.frame = self.bounds;
+        self.surface.cornerRadius = 25;
+        [self.layer addSublayer:self.surface];
+        self.glyph = [CAShapeLayer layer];
+        self.glyph.frame = CGRectMake(13, 13, 24, 24);
+        self.glyph.path = HaciOSGlyph(key).CGPath;
+        self.glyph.strokeColor = HaciOSWhite(.96).CGColor;
+        self.glyph.fillColor = UIColor.clearColor.CGColor;
+        self.glyph.lineWidth = 1.4;
+        self.glyph.lineCap = kCALineCapRound;
+        self.glyph.lineJoin = kCALineJoinRound;
+        [self.layer addSublayer:self.glyph];
+    }
+    return self;
+}
+- (BOOL)containsOverlayPoint:(CGPoint)point {
+    // İki layer da aynı presentation ağacından alınır. Model frame'i dönen ikona ait değildir.
+    CALayer *target = self.layer.presentationLayer;
+    CALayer *root = HaciOSOrbit.overlay.layer.presentationLayer;
+    if (!target || !root) { target = self.layer; root = HaciOSOrbit.overlay.layer; }
+    CGPoint local = [target convertPoint:point fromLayer:root];
+    CGFloat dx = local.x - CGRectGetMidX(target.bounds), dy = local.y - CGRectGetMidY(target.bounds);
+    return dx*dx + dy*dy <= 25*25;
+}
+- (BOOL)beginTracking:(UITouch *)touch withEvent:(UIEvent *)event {
+    return [self containsOverlayPoint:[touch locationInView:HaciOSOrbit.overlay]];
+}
+- (BOOL)continueTracking:(UITouch *)touch withEvent:(UIEvent *)event { return YES; }
+- (void)endTracking:(UITouch *)touch withEvent:(UIEvent *)event {
+    // UIControl'un model koordinatlarına dayanan varsayılan touchUpInside hesabını kullanma.
+    if (touch && [self containsOverlayPoint:[touch locationInView:HaciOSOrbit.overlay]])
+        [self sendActionsForControlEvents:UIControlEventTouchUpInside];
+}
+- (BOOL)accessibilityActivate {
+    [self sendActionsForControlEvents:UIControlEventTouchUpInside];
+    return YES;
+}
+- (void)flash {
+    CABasicAnimation *flash = [CABasicAnimation animationWithKeyPath:@"shadowOpacity"];
+    flash.fromValue = @.65;
+    flash.toValue = @.12;
+    flash.duration = .5;
+    [self.layer addAnimation:flash forKey:@"touch.flash"];
+}
+@end
 @implementation HaciOSOverlayView
-- (void)didMoveToWindow {
-    [super didMoveToWindow];
-    @try { [self.coordinator syncPause:NO]; }
-    @catch (NSException *exception) { HaciOSLog(@"window visibility failed: %@", exception.name); }
-}
-- (void)didMoveToSuperview {
-    [super didMoveToSuperview];
-    @try { [self.coordinator syncPause:NO]; }
-    @catch (NSException *exception) { HaciOSLog(@"parent visibility failed: %@", exception.name); }
-}
-- (void)setHidden:(BOOL)hidden {
-    [super setHidden:hidden];
-    @try { [self.coordinator syncPause:NO]; }
-    @catch (NSException *exception) { HaciOSLog(@"hidden state failed: %@", exception.name); }
+- (instancetype)initWithFrame:(CGRect)frame {
+    if ((self = [super initWithFrame:frame])) {
+        self.backgroundColor = UIColor.blackColor;
+        self.opaque = YES;
+        self.multipleTouchEnabled = NO;
+        self.scene = [[UIView alloc] initWithFrame:self.bounds];
+        self.scene.userInteractionEnabled = YES;
+        [self addSubview:self.scene];
+        self.hole = [[UIView alloc] initWithFrame:CGRectZero];
+        self.hole.userInteractionEnabled = NO;
+        [self.scene addSubview:self.hole];
+
+        self.halo = [CAGradientLayer layer];
+        self.halo.type = kCAGradientLayerRadial;
+        self.halo.startPoint = CGPointMake(.5, .5);
+        self.halo.endPoint = CGPointMake(1, 1);
+        self.halo.colors = @[(id)HaciOSWhite(0).CGColor, (id)HaciOSWhite(.11).CGColor,
+                             (id)HaciOSWhite(.04).CGColor, (id)HaciOSWhite(0).CGColor];
+        self.halo.locations = @[@0, @.29, @.46, @1];
+        [self.hole.layer addSublayer:self.halo];
+        NSMutableArray *disks = [NSMutableArray array];
+        for (NSUInteger i = 0; i < 3; i++) {
+            CAGradientLayer *disk = [CAGradientLayer layer];
+            disk.type = kCAGradientLayerConic;
+            disk.startPoint = CGPointMake(.5, .5);
+            disk.endPoint = CGPointMake(.5, 0);
+            disk.colors = @[(id)HaciOSWhite(.02).CGColor, (id)HaciOSWhite(.35).CGColor,
+                            (id)HaciOSWhite(.06).CGColor, (id)HaciOSWhite(.16).CGColor, (id)HaciOSWhite(.02).CGColor];
+            disk.locations = @[@0, @.3, @.5, @.8, @1];
+            CAShapeLayer *mask = [CAShapeLayer layer];
+            mask.fillColor = UIColor.clearColor.CGColor;
+            mask.strokeColor = UIColor.whiteColor.CGColor;
+            mask.lineWidth = 3 + i*2;
+            disk.mask = mask;
+            [self.hole.layer addSublayer:disk];
+            [disks addObject:disk];
+        }
+        self.disks = disks;
+        self.photon = [CAGradientLayer layer];
+        self.photon.type = kCAGradientLayerConic;
+        self.photon.startPoint = CGPointMake(.5, .5);
+        self.photon.endPoint = CGPointMake(.5, 0);
+        self.photon.colors = @[(id)HaciOSWhite(.9).CGColor, (id)HaciOSWhite(.35).CGColor,
+                              (id)HaciOSWhite(1).CGColor, (id)HaciOSWhite(.6).CGColor, (id)HaciOSWhite(.9).CGColor];
+        self.photon.locations = @[@0, @.25, @.5, @.75, @1];
+        self.photonMask = [CAShapeLayer layer];
+        self.photonMask.fillColor = UIColor.clearColor.CGColor;
+        self.photonMask.strokeColor = UIColor.whiteColor.CGColor;
+        self.photonMask.lineWidth = 1.35;
+        self.photon.mask = self.photonMask;
+        // Ayrı CAShapeLayer gölgesi maskenin glow'u kesmesini önler.
+        CAShapeLayer *glow = [CAShapeLayer layer];
+        glow.name = @"photon.glow";
+        glow.fillColor = UIColor.clearColor.CGColor;
+        glow.strokeColor = HaciOSWhite(.28).CGColor;
+        glow.lineWidth = 3;
+        glow.shadowColor = UIColor.whiteColor.CGColor;
+        glow.shadowOpacity = .65;
+        glow.shadowRadius = 7;
+        glow.shadowOffset = CGSizeZero;
+        [self.hole.layer addSublayer:glow];
+        [self.hole.layer addSublayer:self.photon];
+        self.horizon = [CAShapeLayer layer];
+        self.horizon.fillColor = UIColor.blackColor.CGColor;
+        [self.hole.layer addSublayer:self.horizon];
+
+        NSArray *keys = @[@[@"haci", @"claude", @"kamera", @"safari", @"mesaj"],
+                           @[@"telefon", @"foto", @"not", @"mail", @"whatsapp", @"dosya", @"ayar"]];
+        NSDictionary *names = @{@"haci": @"Hacı", @"claude": @"Claude", @"kamera": @"Kamera",
+            @"safari": @"Safari", @"mesaj": @"Mesajlar", @"telefon": @"Telefon", @"foto": @"Fotoğraflar",
+            @"not": @"Notlar", @"mail": @"Mail", @"whatsapp": @"WhatsApp", @"dosya": @"Dosyalar", @"ayar": @"Ayarlar"};
+        NSMutableArray *orbits = [NSMutableArray array], *icons = [NSMutableArray array], *rings = [NSMutableArray array];
+        for (NSUInteger r = 0; r < 2; r++) {
+            CAShapeLayer *ring = [CAShapeLayer layer];
+            ring.fillColor = UIColor.clearColor.CGColor;
+            ring.strokeColor = HaciOSWhite(.07).CGColor;
+            ring.lineWidth = 1;
+            [self.scene.layer addSublayer:ring];
+            [rings addObject:ring];
+            UIView *orbit = [[UIView alloc] initWithFrame:CGRectZero];
+            [self.scene addSubview:orbit];
+            [orbits addObject:orbit];
+            NSMutableArray *buttons = [NSMutableArray array];
+            for (NSString *key in keys[r]) {
+                HaciOSIconControl *icon = [[HaciOSIconControl alloc] initWithKey:key name:names[key]];
+                [icon addTarget:self action:@selector(pickIcon:) forControlEvents:UIControlEventTouchUpInside];
+                [orbit addSubview:icon];
+                [buttons addObject:icon];
+            }
+            [icons addObject:buttons];
+        }
+        self.orbits = orbits; self.icons = icons; self.rings = rings;
+        self.clock = [[UIView alloc] initWithFrame:CGRectZero];
+        self.clock.accessibilityLabel = @"Saate bir saniye içinde üç kez dokunarak normal ana ekrana dön";
+        self.clock.accessibilityTraits = UIAccessibilityTraitButton;
+        self.clock.isAccessibilityElement = YES;
+        [self addSubview:self.clock];
+        self.timeLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+        self.timeLabel.textAlignment = NSTextAlignmentCenter;
+        self.dateLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+        self.dateLabel.textAlignment = NSTextAlignmentCenter;
+        [self.clock addSubview:self.timeLabel]; [self.clock addSubview:self.dateLabel];
+        [self.clock addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(clockTapped:)]];
+        self.statusLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+        self.statusLabel.textAlignment = NSTextAlignmentCenter;
+        self.statusLabel.hidden = YES;
+        self.statusLabel.isAccessibilityElement = YES;
+        [self addSubview:self.statusLabel];
+        self.capsule = [[UIControl alloc] initWithFrame:CGRectZero];
+        self.capsule.layer.cornerRadius = 22;
+        self.capsule.layer.borderWidth = 1;
+        self.capsule.layer.borderColor = HaciOSWhite(.35).CGColor;
+        self.capsule.clipsToBounds = YES;
+        self.capsule.accessibilityLabel = @"Hacı'ya sor, yakında";
+        self.capsule.accessibilityTraits = UIAccessibilityTraitButton;
+        self.capsule.isAccessibilityElement = YES;
+        [self.capsule addTarget:self action:@selector(askHaci:) forControlEvents:UIControlEventTouchUpInside];
+        UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleDark]];
+        blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        blur.userInteractionEnabled = NO;
+        [self.capsule addSubview:blur];
+        UILabel *ask = [[UILabel alloc] initWithFrame:CGRectMake(33, 0, 240, 44)];
+        ask.attributedText = HaciOSText(@"Hacı'ya sor", [UIFont systemFontOfSize:12], 1.68, .62);
+        ask.userInteractionEnabled = NO;
+        [self.capsule addSubview:ask];
+        self.pulse = [CALayer layer];
+        self.pulse.frame = CGRectMake(16, 18.5, 7, 7);
+        self.pulse.cornerRadius = 3.5;
+        self.pulse.backgroundColor = HaciOSWhite(.96).CGColor;
+        self.pulse.shadowColor = UIColor.whiteColor.CGColor;
+        self.pulse.shadowOpacity = .8;
+        self.pulse.shadowRadius = 5;
+        self.pulse.shadowOffset = CGSizeZero;
+        self.pulse.opacity = .4;
+        [self.capsule.layer addSublayer:self.pulse];
+        // Kapsül de scene altında: tek layer saati bütün CA animasyonlarını durdurur.
+        [self.scene addSubview:self.capsule];
+        self.timeFormatter = [[NSDateFormatter alloc] init];
+        self.timeFormatter.locale = [NSLocale localeWithLocaleIdentifier:@"tr_TR"];
+        self.timeFormatter.dateFormat = @"HH:mm";
+        self.dateFormatter = [[NSDateFormatter alloc] init];
+        self.dateFormatter.locale = [NSLocale localeWithLocaleIdentifier:@"tr_TR"];
+        self.dateFormatter.dateFormat = @"EEEE d MMMM";
+        CFTimeInterval epoch = [self.scene.layer convertTime:CACurrentMediaTime() fromLayer:nil];
+        if (!UIAccessibilityIsReduceMotionEnabled()) {
+            for (NSUInteger r = 0; r < 2; r++) {
+                CGFloat direction = r == 0 ? 1 : -1;
+                CFTimeInterval duration = 2*M_PI/(r == 0 ? .055 : .034);
+                HaciOSRotate(self.orbits[r].layer, duration, direction, epoch);
+                for (HaciOSIconControl *icon in self.icons[r]) HaciOSRotate(icon.layer, duration, -direction, epoch);
+            }
+            for (NSUInteger i = 0; i < self.disks.count; i++) HaciOSRotate(self.disks[i], 90+i*37, i == 1 ? -1 : 1, epoch);
+            HaciOSRotate(self.photon, 150, 1, epoch);
+            CABasicAnimation *pulse = [CABasicAnimation animationWithKeyPath:@"opacity"];
+            pulse.fromValue = @.4; pulse.toValue = @1;
+            pulse.duration = 1.6; pulse.autoreverses = YES; pulse.repeatCount = HUGE_VALF;
+            pulse.beginTime = epoch;
+            pulse.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+            [self.pulse addAnimation:pulse forKey:@"haci.pulse"];
+        }
+        [self updateClock];
+        [self setScenePaused:YES];
+    }
+    return self;
 }
 - (void)layoutSubviews {
     [super layoutSubviews];
-    @try { [self.coordinator syncPause:NO]; }
-    @catch (NSException *exception) { HaciOSLog(@"layout visibility failed: %@", exception.name); }
-}
-@end
-
-@implementation HaciOSCoordinator
-- (void)loadOrbitHTML {
-    self.pageReady = NO;
-    // Timeout yedeği bir kez açıldıktan sonra reload sırasında da görünürlüğü korur.
-    self.currentNavigation = nil;
-    self.webView.hidden = YES; // Hazır sinyali yoksa yalnız siyah native zemin gösterilir.
-    NSUInteger generation = ++self.loadGeneration;
-    __weak HaciOSCoordinator *weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        HaciOSCoordinator *coordinator = weakSelf;
-        // Yeniden başlayan WebContent süreçleri ilk 3 sn süresini sonsuza kadar uzatmasın.
-        if (!coordinator || coordinator.pageReady || coordinator.pageReadyTimedOut) return;
-        coordinator.pageReadyTimedOut = YES;
-        HaciOSLog(@"page readiness timed out after 3s (startedLoad=%lu currentLoad=%lu); showing black fallback on home",
-                  (unsigned long)generation, (unsigned long)coordinator.loadGeneration);
-        [coordinator refreshVisibility];
-    });
     @try {
-        NSString *path = ROOT_PATH_NS(@"/Library/Application Support/HaciOS/orbit.html");
-        NSError *error = nil;
-        // WebContent sandbox'ına /var/jb okuma izni verme; belgeyi SpringBoard okur.
-        // Orbit'in CSS, JS, shader ve SVG içeriği gömülüdür; harici dosya gerekmez.
-        NSString *html = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&error];
-        if (!html.length) {
-            HaciOSLog(@"orbit HTML read failed/empty: path=%@ error=%@; awaiting black fallback", path, error);
-        } else {
-            HaciOSLog(@"loading inline orbit HTML: path=%@ chars=%lu load=%lu", path,
-                      (unsigned long)html.length, (unsigned long)generation);
-            self.currentNavigation = [self.webView loadHTMLString:html baseURL:nil];
-            if (!self.currentNavigation) HaciOSLog(@"loadHTMLString returned no navigation; awaiting black fallback");
-        }
-    } @catch (NSException *exception) {
-        HaciOSLog(@"inline HTML load failed: %@; awaiting black fallback", exception);
-    }
-    [self refreshVisibility];
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        @try {
+            CGFloat width = CGRectGetWidth(self.bounds), height = CGRectGetHeight(self.bounds);
+            self.scene.frame = self.bounds;
+            // Prototip CY=.47 alttan ölçülür → UIKit'te üstten .53.
+            CGPoint center = CGPointMake(width*.5, height*.53);
+            CGFloat outer = MAX(0, MIN(MIN(width, height*.46)*.46, width*.5-32));
+            CGFloat radii[2] = {outer*.57, outer};
+            CGFloat size = height*.4, horizon = height*.058;
+            self.hole.bounds = CGRectMake(0, 0, size, size);
+            self.hole.center = center;
+            self.halo.frame = self.hole.bounds;
+            CGPoint holeCenter = CGPointMake(size*.5, size*.5);
+            for (NSUInteger i = 0; i < self.disks.count; i++) {
+                CAGradientLayer *disk = self.disks[i];
+                CGFloat w = MIN(width*.95, horizon*(6.2-i*.65)), h = horizon*(1.5+i*.18);
+                disk.bounds = CGRectMake(0, 0, w, h);
+                disk.position = holeCenter;
+                CAShapeLayer *mask = (CAShapeLayer *)disk.mask;
+                mask.frame = disk.bounds;
+                mask.path = [UIBezierPath bezierPathWithOvalInRect:CGRectInset(disk.bounds, 5, 5)].CGPath;
+            }
+            CGFloat photonRadius = horizon*1.1;
+            CGRect photonRect = CGRectMake(holeCenter.x-photonRadius, holeCenter.y-photonRadius, 2*photonRadius, 2*photonRadius);
+            self.photon.bounds = self.hole.bounds;
+            self.photon.position = holeCenter;
+            self.photonMask.frame = self.photon.bounds;
+            self.photonMask.path = [UIBezierPath bezierPathWithOvalInRect:photonRect].CGPath;
+            for (CALayer *layer in self.hole.layer.sublayers) {
+                if ([layer.name isEqualToString:@"photon.glow"]) {
+                    CAShapeLayer *glow = (CAShapeLayer *)layer;
+                    glow.frame = self.hole.bounds;
+                    glow.path = [UIBezierPath bezierPathWithOvalInRect:photonRect].CGPath;
+                }
+            }
+            self.horizon.frame = self.hole.bounds;
+            self.horizon.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(holeCenter.x-horizon, holeCenter.y-horizon, 2*horizon, 2*horizon)].CGPath;
+            for (NSUInteger r = 0; r < 2; r++) {
+                CGFloat radius = radii[r];
+                UIView *orbit = self.orbits[r];
+                orbit.bounds = CGRectMake(0, 0, 2*radius, 2*radius);
+                orbit.center = center;
+                CAShapeLayer *ring = self.rings[r];
+                ring.frame = self.scene.bounds;
+                ring.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(center.x-radius, center.y-radius, 2*radius, 2*radius)].CGPath;
+                NSArray *icons = self.icons[r];
+                for (NSUInteger i = 0; i < icons.count; i++) {
+                    CGFloat angle = (CGFloat)i/icons.count*2*M_PI + (r ? M_PI/icons.count : 0) - M_PI/2;
+                    HaciOSIconControl *icon = icons[i];
+                    icon.center = CGPointMake(radius+cos(angle)*radius, radius+sin(angle)*radius);
+                }
+            }
+            self.clock.frame = CGRectMake(0, MAX(self.safeAreaInsets.top, 14), width, 60);
+            self.timeLabel.frame = CGRectMake(0, 8, width, 20);
+            self.dateLabel.frame = CGRectMake(0, 34, width, 16);
+            self.statusLabel.frame = CGRectMake(0, center.y+outer+40, width, 24);
+            CGFloat capsuleWidth = MIN(width*.78, 300);
+            self.capsule.bounds = CGRectMake(0, 0, capsuleWidth, 44);
+            self.capsule.center = CGPointMake(width*.5, height-MAX(self.safeAreaInsets.bottom, 22)-22);
+        } @finally { [CATransaction commit]; }
+        [self.coordinator refreshVisibility];
+    } @catch (NSException *exception) { HaciOSErrorOnce(@"layout", exception.name); }
 }
-
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    @try {
+        if (self.hidden || self.alpha <= .01 || !self.userInteractionEnabled || ![self pointInside:point withEvent:event]) return nil;
+        // Önce ekrandaki sunum konumu; UIView'ın eski model frame'ine geri düşme.
+        for (NSArray *ring in [self.icons reverseObjectEnumerator])
+            for (HaciOSIconControl *icon in [ring reverseObjectEnumerator])
+                if ([icon containsOverlayPoint:point]) return icon;
+        UIView *hit = [super hitTest:point withEvent:event];
+        if ([hit isKindOfClass:[HaciOSIconControl class]]) return self;
+        return hit ?: self;
+    } @catch (NSException *exception) { HaciOSErrorOnce(@"hit test", exception.name); return self; }
+}
+- (void)didMoveToWindow {
+    [super didMoveToWindow];
+    @try { [self.coordinator refreshVisibility]; }
+    @catch (NSException *exception) { HaciOSErrorOnce(@"window", exception.name); }
+}
+- (void)didMoveToSuperview {
+    [super didMoveToSuperview];
+    @try { [self.coordinator refreshVisibility]; }
+    @catch (NSException *exception) { HaciOSErrorOnce(@"parent", exception.name); }
+}
+- (void)updateClock {
+    NSDate *now = [NSDate date];
+    self.timeFormatter.timeZone = NSTimeZone.localTimeZone;
+    self.dateFormatter.timeZone = NSTimeZone.localTimeZone;
+    NSString *time = [self.timeFormatter stringFromDate:now];
+    NSString *date = [[self.dateFormatter stringFromDate:now] uppercaseStringWithLocale:self.dateFormatter.locale];
+    self.timeLabel.attributedText = HaciOSText(time, [UIFont systemFontOfSize:15 weight:UIFontWeightLight], 4.8, .92);
+    self.dateLabel.attributedText = HaciOSText(date, [UIFont systemFontOfSize:10], 4.2, .45);
+    self.dateLabel.adjustsFontSizeToFitWidth = YES;
+    self.dateLabel.minimumScaleFactor = .7;
+    self.clock.accessibilityValue = [NSString stringWithFormat:@"%@, %@", time, date];
+}
+- (void)setScenePaused:(BOOL)paused {
+    if (_paused == paused) return;
+    _paused = paused;
+    CALayer *layer = self.scene.layer;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    if (paused) {
+        CFTimeInterval local = [layer convertTime:CACurrentMediaTime() fromLayer:nil];
+        layer.speed = 0;
+        layer.timeOffset = local;
+    } else {
+        CFTimeInterval saved = layer.timeOffset;
+        layer.speed = 1;
+        layer.timeOffset = 0;
+        layer.beginTime = 0;
+        layer.beginTime = [layer convertTime:CACurrentMediaTime() fromLayer:nil] - saved;
+    }
+    [CATransaction commit];
+    [self.clockTimer invalidate]; self.clockTimer = nil;
+    [self.labelTimer invalidate]; self.labelTimer = nil;
+    self.statusLabel.hidden = YES;
+    self.clockTapCount = 0;
+    if (paused) {
+        for (NSArray *ring in self.icons)
+            for (HaciOSIconControl *icon in ring) [icon.layer removeAnimationForKey:@"touch.flash"];
+    } else {
+        [self updateClock];
+        __weak HaciOSOverlayView *weakSelf = self;
+        self.clockTimer = [NSTimer timerWithTimeInterval:60 repeats:YES block:^(NSTimer *timer) {
+            @try { [weakSelf updateClock]; }
+            @catch (NSException *exception) { HaciOSErrorOnce(@"clock", exception.name); }
+        }];
+        self.clockTimer.fireDate = [NSDate dateWithTimeIntervalSinceNow:60-fmod(NSDate.date.timeIntervalSince1970, 60)];
+        self.clockTimer.tolerance = 1;
+        [[NSRunLoop mainRunLoop] addTimer:self.clockTimer forMode:NSRunLoopCommonModes];
+    }
+}
+- (void)showStatus:(NSString *)text {
+    if (self.paused) return;
+    [self.labelTimer invalidate];
+    self.statusLabel.attributedText = HaciOSText([text uppercaseStringWithLocale:self.dateFormatter.locale], [UIFont systemFontOfSize:11], 4.18, .9);
+    self.statusLabel.hidden = NO;
+    UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, text);
+    __weak HaciOSOverlayView *weakSelf = self;
+    self.labelTimer = [NSTimer timerWithTimeInterval:1.6 repeats:NO block:^(NSTimer *timer) {
+        weakSelf.statusLabel.hidden = YES;
+        weakSelf.labelTimer = nil;
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:self.labelTimer forMode:NSRunLoopCommonModes];
+}
+- (void)pickIcon:(HaciOSIconControl *)icon {
+    @try {
+        if (self.paused || self.hidden) return;
+        [icon flash];
+        [self showStatus:icon.accessibilityLabel];
+        [self.coordinator openKey:icon.key];
+    } @catch (NSException *exception) { HaciOSErrorOnce(@"pick", exception.name); [self showStatus:@"AÇILAMADI"]; }
+}
+- (void)askHaci:(UIControl *)sender {
+    @try { [self.coordinator openKey:@"haci"]; }
+    @catch (NSException *exception) { HaciOSErrorOnce(@"capsule", exception.name); }
+}
+- (void)clockTapped:(UITapGestureRecognizer *)gesture {
+    @try {
+        if (self.hidden) return;
+        CFTimeInterval now = CACurrentMediaTime();
+        if (!self.clockTapCount || now-self.firstClockTap > 1) { self.clockTapCount = 0; self.firstClockTap = now; }
+        if (++self.clockTapCount == 3) { self.clockTapCount = 0; [self.coordinator hideUntilRespring]; }
+    } @catch (NSException *exception) { HaciOSErrorOnce(@"clock tap", exception.name); }
+}
+- (void)dealloc { [self.clockTimer invalidate]; [self.labelTimer invalidate]; }
+@end
+@implementation HaciOSCoordinator
 - (void)attachToController:(UIViewController *)controller {
     @try {
-        BOOL disabled = HaciOSIsDisabled();
-        HaciOSLog(@"attachToController: class=%@ hiddenUntilRespring=%d disabled=%d",
-                  NSStringFromClass(controller.class), HaciOSHiddenUntilRespring, disabled);
-        if (!controller || HaciOSHiddenUntilRespring || disabled) {
-            HaciOSLog(@"attachment skipped: controller=%@ hiddenUntilRespring=%d disabled=%d",
-                      controller, HaciOSHiddenUntilRespring, disabled);
-            return;
-        }
-        UIView *homeView = controller.viewIfLoaded;
-        // Aynı SpringBoard penceresinin en üst alt görünümü dock'u da örter.
-        // Ayrı bir alert/key window oluşturma: uygulama ve sistem pencereleriyle yarışmaz.
-        UIWindow *host = homeView.window;
-        HaciOSLog(@"host: class=%@ frame=%@ bounds=%@ hidden=%d; home: class=%@ frame=%@ window=%@",
-                  NSStringFromClass(host.class), NSStringFromCGRect(host.frame), NSStringFromCGRect(host.bounds),
-                  host.hidden, NSStringFromClass(homeView.class), NSStringFromCGRect(homeView.frame), homeView.window);
-        if (!host || CGRectIsEmpty(host.bounds)) {
-            HaciOSLog(@"attachment deferred: host missing or empty; retry on home appearance");
-            return;
-        }
+        if (!controller || HaciOSHiddenUntilRespring || HaciOSIsDisabled()) { [self refreshVisibility]; return; }
+        UIView *home = controller.viewIfLoaded;
+        UIWindow *host = home.window;
+        Class homeWindow = objc_getClass("SBHomeScreenWindow");
+        // Çalıştığı doğrulanan ana ekran penceresinde kal; uygulama/key window oluşturma.
+        if (!homeWindow || ![host isKindOfClass:homeWindow] || CGRectIsEmpty(host.bounds)) return;
+        BOOL newOwner = self.owner != controller;
         self.owner = controller;
         self.ownerVisible = YES;
         if (!self.overlay) {
-            WKWebViewConfiguration *configuration = [[WKWebViewConfiguration alloc] init];
-            HaciOSMessageHandler *handler = [[HaciOSMessageHandler alloc] init];
-            handler.coordinator = self;
-            [configuration.userContentController addScriptMessageHandler:handler name:@"hacios"];
-            HaciOSOverlayView *overlay = [[HaciOSOverlayView alloc] initWithFrame:CGRectZero];
-            overlay.coordinator = self;
-            overlay.translatesAutoresizingMaskIntoConstraints = NO;
-            overlay.backgroundColor = [UIColor blackColor];
-            overlay.opaque = YES;
-            overlay.hidden = YES;
-            WKWebView *webView = [[WKWebView alloc] initWithFrame:CGRectZero configuration:configuration];
-            webView.translatesAutoresizingMaskIntoConstraints = NO;
-            webView.backgroundColor = [UIColor blackColor];
-            webView.opaque = YES;
-            webView.scrollView.backgroundColor = [UIColor blackColor];
-            webView.scrollView.scrollEnabled = NO;
-            webView.scrollView.bounces = NO;
-            webView.scrollView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
-            webView.navigationDelegate = self;
-            [overlay addSubview:webView];
-            [NSLayoutConstraint activateConstraints:@[
-                [webView.topAnchor constraintEqualToAnchor:overlay.topAnchor],
-                [webView.bottomAnchor constraintEqualToAnchor:overlay.bottomAnchor],
-                [webView.leadingAnchor constraintEqualToAnchor:overlay.leadingAnchor],
-                [webView.trailingAnchor constraintEqualToAnchor:overlay.trailingAnchor]
-            ]];
-            self.overlay = overlay;
-            self.webView = webView;
-            self.paused = YES;
-            [self loadOrbitHTML];
+            self.overlay = [[HaciOSOverlayView alloc] initWithFrame:host.bounds];
+            self.overlay.coordinator = self;
+            self.overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+            self.overlay.hidden = YES;
         }
         if (self.overlay.superview != host) {
             [self.overlay removeFromSuperview];
+            self.overlay.frame = host.bounds;
             [host addSubview:self.overlay];
-            [NSLayoutConstraint activateConstraints:@[
-                [self.overlay.topAnchor constraintEqualToAnchor:host.topAnchor],
-                [self.overlay.bottomAnchor constraintEqualToAnchor:host.bottomAnchor],
-                [self.overlay.leadingAnchor constraintEqualToAnchor:host.leadingAnchor],
-                [self.overlay.trailingAnchor constraintEqualToAnchor:host.trailingAnchor]
-            ]];
-            HaciOSLog(@"overlay added above dock (%@)", NSStringFromClass(controller.class));
+            HaciOSLog(@"attach: %@ in %@", NSStringFromClass(controller.class), NSStringFromClass(host.class));
+        } else if (newOwner) {
+            HaciOSLog(@"attach: owner %@", NSStringFromClass(controller.class));
         }
         [host bringSubviewToFront:self.overlay];
-        [host layoutIfNeeded];
-        HaciOSLog(@"overlay attached: class=%@ frame=%@ host=%@", NSStringFromClass(self.overlay.class),
-                  NSStringFromCGRect(self.overlay.frame), NSStringFromClass(host.class));
+        [self.overlay setNeedsLayout];
+        [self.overlay layoutIfNeeded];
         [self refreshVisibility];
     } @catch (NSException *exception) {
         self.ownerVisible = NO;
-        @try {
-            self.overlay.hidden = YES;
-            [self syncPause:YES];
-        } @catch (__unused NSException *cleanupException) {}
-        HaciOSLog(@"overlay attachment failed: %@", exception.name);
+        [self refreshVisibility];
+        HaciOSErrorOnce(@"attach", exception.name);
     }
 }
-
 - (void)refreshVisibility {
-    @try {
-        BOOL disabled = HaciOSIsDisabled();
-        BOOL viewVisible = HaciOSViewIsVisible(self.owner.viewIfLoaded);
-        // Özel hasBlankedScreen bildirimi görünürlüğü engellemez; yalnız animasyonu duraklatır.
-        BOOL visible = (self.pageReady || self.pageReadyTimedOut) && self.ownerVisible && HaciOSFrontIsHome &&
-                       !HaciOSHiddenUntilRespring && !disabled && viewVisible;
-        HaciOSLog(@"refreshVisibility: pageReady=%d timeout=%d ownerVisible=%d FrontIsHome=%d ScreenBlanked=%d "
-                  @"hiddenUntilRespring=%d disabled=%d viewVisible=%d visible=%d",
-                  self.pageReady, self.pageReadyTimedOut, self.ownerVisible, HaciOSFrontIsHome,
-                  HaciOSScreenBlanked, HaciOSHiddenUntilRespring, disabled, viewVisible, visible);
-        self.webView.hidden = !self.pageReady;
-        self.overlay.hidden = !visible;
-        if (visible) [self.overlay.superview bringSubviewToFront:self.overlay];
-        [self syncPause:NO];
-    } @catch (NSException *exception) {
-        HaciOSLog(@"visibility failed: %@", exception.name);
-    }
-}
-
-- (void)syncPause:(BOOL)force {
-    @try {
-        BOOL paused = HaciOSHiddenUntilRespring || HaciOSScreenBlanked || !HaciOSFrontIsHome ||
-                      !self.ownerVisible || !HaciOSViewIsVisible(self.owner.viewIfLoaded) ||
-                      !HaciOSViewIsVisible(self.overlay) || HaciOSIsDisabled();
-        if (!force && self.paused == paused) return;
-        self.paused = paused;
-        HaciOSLog(@"pause: %@", paused ? @"true" : @"false");
-        if (self.pageReady) {
-            [self.webView evaluateJavaScript:paused ? @"window.haciPause && window.haciPause(true);" :
-                                                    @"window.haciPause && window.haciPause(false);"
-                          completionHandler:^(id result, NSError *error) {
-                if (error) HaciOSLog(@"pause JS failed: %@", error.localizedDescription);
-            }];
-        }
-    } @catch (NSException *exception) {
-        HaciOSLog(@"pause failed: %@", exception.name);
-    }
-}
-
-- (void)toast:(NSString *)text {
-    @try {
-        if (!self.pageReady || !text) return;
-        NSData *json = [NSJSONSerialization dataWithJSONObject:@[text] options:0 error:nil];
-        if (!json) return;
-        NSString *arguments = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
-        NSString *script = [NSString stringWithFormat:@"window.haciToast && window.haciToast.apply(null,%@);", arguments];
-        [self.webView evaluateJavaScript:script completionHandler:^(id result, NSError *error) {
-            if (error) HaciOSLog(@"toast JS failed: %@", error.localizedDescription);
-        }];
-    } @catch (NSException *exception) {
-        HaciOSLog(@"toast failed: %@", exception.name);
-    }
-}
-
-- (void)handleMessage:(WKScriptMessage *)message {
     if (![NSThread isMainThread]) {
         __weak HaciOSCoordinator *weakSelf = self;
-        dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf handleMessage:message]; });
+        dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf refreshVisibility]; });
         return;
     }
+    if (self.refreshing) return;
+    self.refreshing = YES;
     @try {
-        if (HaciOSHiddenUntilRespring || HaciOSIsDisabled()) return;
-        if (![message.body isKindOfClass:[NSDictionary class]]) return;
-        NSDictionary *body = message.body;
-        id command = body[@"cmd"];
-        if (![command isKindOfClass:[NSString class]]) return;
-        if ([command isEqualToString:@"hide"]) {
-            HaciOSHiddenUntilRespring = YES;
-            self.overlay.hidden = YES;
-            [self syncPause:YES];
-            HaciOSLog(@"overlay hidden until respring");
-            return;
-        }
-        if (![command isEqualToString:@"open"] || self.overlay.hidden || !HaciOSFrontIsHome) return;
-        id key = body[@"key"];
-        if (![key isKindOfClass:[NSString class]]) return;
+        BOOL visible = self.overlay.superview && self.ownerVisible && HaciOSFrontIsHome &&
+            !HaciOSHiddenUntilRespring && !HaciOSIsDisabled() && HaciOSViewIsVisible(self.owner.viewIfLoaded);
+        BOOL paused = !visible || HaciOSScreenBlanked || !HaciOSViewIsVisible(self.overlay.superview);
+        BOOL changed = self.overlay && (self.overlay.hidden == visible || self.overlay.paused != paused);
+        self.overlay.hidden = !visible;
+        if (visible && self.overlay.superview.subviews.lastObject != self.overlay)
+            [self.overlay.superview bringSubviewToFront:self.overlay];
+        [self.overlay setScenePaused:paused];
+        HaciOSRefreshChrome();
+        if (changed) HaciOSLog(@"visibility: visible=%d paused=%d", visible, paused);
+    } @catch (NSException *exception) {
+        HaciOSHiddenUntilRespring = YES; // Hata halinde stok ana ekranı serbest bırak.
+        self.overlay.hidden = YES;
+        [self.overlay setScenePaused:YES];
+        HaciOSRefreshChrome();
+        HaciOSErrorOnce(@"visibility", exception.name);
+    } @finally { self.refreshing = NO; }
+}
+- (void)hideUntilRespring {
+    HaciOSHiddenUntilRespring = YES;
+    [self refreshVisibility];
+}
+- (void)openKey:(NSString *)key {
+    @try {
+        if (HaciOSHiddenUntilRespring || HaciOSIsDisabled()) { [self refreshVisibility]; return; }
+        if (self.overlay.hidden || self.overlay.paused || !HaciOSFrontIsHome) return;
         if ([key isEqualToString:@"haci"]) {
-            [self toast:@"YAKINDA"];
+            [self.overlay showStatus:@"YAKINDA"];
+            HaciOSLog(@"open haci: YAKINDA");
             return;
         }
         if ([key isEqualToString:@"claude"]) {
-            NSURL *url = [NSURL URLWithString:@"https://claude.ai"];
             __weak HaciOSCoordinator *weakSelf = self;
-            [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:^(BOOL success) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    HaciOSLog(@"open claude URL: %@", success ? @"accepted" : @"failed");
-                    if (!success) [weakSelf toast:@"Açılamadı"];
-                });
-            }];
+            [[UIApplication sharedApplication] openURL:[NSURL URLWithString:@"https://claude.ai"] options:@{}
+                completionHandler:^(BOOL success) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        @try {
+                            HaciOSLog(@"open claude URL: %@", success ? @"accepted" : @"failed");
+                            if (!success) [weakSelf.overlay showStatus:@"AÇILAMADI"];
+                        } @catch (NSException *exception) { HaciOSErrorOnce(@"URL result", exception.name); }
+                    });
+                }];
             return;
         }
         NSDictionary *bundles = @{
@@ -476,136 +879,100 @@ static BOOL HaciOSLaunchBundle(NSString *bundleID) {
             @"dosya": @"com.apple.DocumentsApp", @"ayar": @"com.apple.Preferences"
         };
         NSString *bundleID = bundles[key];
-        if (!bundleID || !HaciOSLaunchBundle(bundleID)) [self toast:@"Açılamadı"];
+        if (!bundleID || !HaciOSLaunchBundle(bundleID)) [self.overlay showStatus:@"AÇILAMADI"];
     } @catch (NSException *exception) {
-        HaciOSLog(@"open command failed: %@", exception.name);
-        [self toast:@"Açılamadı"];
+        HaciOSErrorOnce(@"open", exception.name);
+        [self.overlay showStatus:@"AÇILAMADI"];
     }
-}
-
-- (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
-    @try {
-        if (webView != self.webView || navigation != self.currentNavigation) return;
-        NSUInteger generation = self.loadGeneration;
-        HaciOSLog(@"orbit navigation finished (load=%lu); checking readiness", (unsigned long)generation);
-        __weak HaciOSCoordinator *weakSelf = self;
-        [webView evaluateJavaScript:@"window.haciReady === true && typeof window.haciPause === 'function' && typeof window.haciToast === 'function'"
-                 completionHandler:^(id result, NSError *error) {
-            @try {
-                HaciOSCoordinator *coordinator = weakSelf;
-                if (!coordinator || webView != coordinator.webView || generation != coordinator.loadGeneration ||
-                    navigation != coordinator.currentNavigation) return;
-                coordinator.pageReady = !error && [result isKindOfClass:[NSNumber class]] && [result boolValue];
-                HaciOSLog(@"orbit readiness: ready=%d result=%@ error=%@", coordinator.pageReady, result, error);
-                [coordinator refreshVisibility];
-                [coordinator syncPause:YES];
-            } @catch (NSException *exception) {
-                HaciOSLog(@"page readiness failed: %@", exception.name);
-            }
-        }];
-    } @catch (NSException *exception) {
-        HaciOSLog(@"page completion failed: %@", exception.name);
-    }
-}
-- (void)webView:(WKWebView *)webView didFailNavigation:(WKNavigation *)navigation withError:(NSError *)error {
-    @try {
-        HaciOSLog(@"orbit navigation failed: domain=%@ code=%ld error=%@", error.domain, (long)error.code, error);
-        if (webView != self.webView || navigation != self.currentNavigation) return;
-        self.pageReady = NO;
-        self.currentNavigation = nil; // Bekleyen eski readiness callback'i artık kabul edilmez.
-        [self refreshVisibility];
-    } @catch (NSException *exception) { HaciOSLog(@"navigation cleanup failed: %@", exception.name); }
-}
-- (void)webView:(WKWebView *)webView didFailProvisionalNavigation:(WKNavigation *)navigation withError:(NSError *)error {
-    HaciOSLog(@"orbit provisional navigation failed: domain=%@ code=%ld error=%@", error.domain, (long)error.code, error);
-    [self webView:webView didFailNavigation:navigation withError:error];
-}
-- (void)webViewWebContentProcessDidTerminate:(WKWebView *)webView {
-    @try {
-        if (webView != self.webView) return;
-        self.pageReady = NO;
-        self.currentNavigation = nil;
-        [self refreshVisibility];
-        BOOL disabled = HaciOSIsDisabled();
-        HaciOSLog(@"web content process terminated: hiddenUntilRespring=%d disabled=%d; scheduling HTML reload",
-                  HaciOSHiddenUntilRespring, disabled);
-        if (HaciOSHiddenUntilRespring || disabled) {
-            HaciOSLog(@"web content reload skipped: hiddenUntilRespring=%d disabled=%d", HaciOSHiddenUntilRespring, disabled);
-            return;
-        }
-        // Tekrarlayan çökmede sıkı bir reload döngüsü kurma; ilk timeout yedeği geçerli kalır.
-        NSUInteger generation = self.loadGeneration;
-        __weak HaciOSCoordinator *weakSelf = self;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-            HaciOSCoordinator *coordinator = weakSelf;
-            if (!coordinator || generation != coordinator.loadGeneration) return;
-            BOOL nowDisabled = HaciOSIsDisabled();
-            if (HaciOSHiddenUntilRespring || nowDisabled) {
-                HaciOSLog(@"scheduled web content reload skipped: hiddenUntilRespring=%d disabled=%d",
-                          HaciOSHiddenUntilRespring, nowDisabled);
-                return;
-            }
-            [coordinator loadOrbitHTML];
-        });
-    } @catch (NSException *exception) { HaciOSLog(@"web content recovery failed: %@", exception.name); }
-}
-- (void)webView:(WKWebView *)webView decidePolicyForNavigationAction:(WKNavigationAction *)action
-    decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
-    // loadHTMLString:baseURL:nil ana belgeyi about:blank olarak açar.
-    // Yalnız programatik ana belge yüklemesine izin ver; dış URL native openURL'den gider.
-    BOOL allowed = NO;
-    @try {
-        allowed = action.targetFrame.isMainFrame && action.navigationType == WKNavigationTypeOther &&
-                  [action.request.URL.absoluteString isEqualToString:@"about:blank"];
-        HaciOSLog(@"navigation policy: URL=%@ type=%ld mainFrame=%d allowed=%d", action.request.URL,
-                  (long)action.navigationType, action.targetFrame.isMainFrame, allowed);
-    } @catch (NSException *exception) { HaciOSLog(@"navigation policy failed: %@", exception.name); }
-    decisionHandler(allowed ? WKNavigationActionPolicyAllow : WKNavigationActionPolicyCancel);
 }
 @end
 
+@interface HaciOSChromeState : NSObject
+@property (nonatomic, assign) CGFloat alpha;
+@property (nonatomic, assign) BOOL interactive;
+@property (nonatomic, assign) BOOL suppressed;
+@property (nonatomic, assign) BOOL applying;
+@end
+@implementation HaciOSChromeState
+@end
+static char HaciOSChromeStateKey;
+static HaciOSChromeState *HaciOSStateForChrome(UIView *view) {
+    return objc_getAssociatedObject(view, &HaciOSChromeStateKey);
+}
+static BOOL HaciOSShouldHideChrome(void) {
+    return HaciOSOrbit.overlay && !HaciOSOrbit.overlay.hidden && HaciOSFrontIsHome &&
+        HaciOSOrbit.ownerVisible && !HaciOSHiddenUntilRespring && !HaciOSIsDisabled();
+}
+static void HaciOSApplyChrome(UIView *view) {
+    @try {
+        if (![view isKindOfClass:[UIView class]]) return;
+        if (!HaciOSChromeViews) HaciOSChromeViews = [NSHashTable weakObjectsHashTable];
+        [HaciOSChromeViews addObject:view];
+        HaciOSChromeState *state = HaciOSStateForChrome(view);
+        BOOL hide = HaciOSShouldHideChrome();
+        if (!state && !hide) return;
+        if (!state) {
+            state = [[HaciOSChromeState alloc] init];
+            objc_setAssociatedObject(view, &HaciOSChromeStateKey, state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        if (hide && !state.suppressed) {
+            state.alpha = view.alpha;
+            state.interactive = view.userInteractionEnabled;
+            state.suppressed = YES;
+        }
+        if (!hide && !state.suppressed) return;
+        state.applying = YES;
+        @try {
+            [UIView performWithoutAnimation:^{
+                view.alpha = hide ? 0 : state.alpha;
+                view.userInteractionEnabled = hide ? NO : state.interactive;
+            }];
+            if (!hide) state.suppressed = NO;
+        } @finally { state.applying = NO; }
+    } @catch (NSException *exception) { HaciOSErrorOnce(@"chrome", exception.name); }
+}
+static void HaciOSRefreshChrome(void) {
+    for (UIView *view in HaciOSChromeViews.allObjects) HaciOSApplyChrome(view);
+}
+static void HaciOSDiscoverChrome(UIView *root) {
+    if (!root || root == HaciOSOrbit.overlay) return;
+    // Tek seferlik attach taraması; dock ayrı penceredeyse o pencere de taranır.
+    for (NSString *name in @[@"SBDockView", @"SBFloatingDockView", @"SBIconListPageControl"]) {
+        Class cls = NSClassFromString(name);
+        if (cls && [root isKindOfClass:cls]) { HaciOSApplyChrome(root); break; }
+    }
+    for (UIView *child in root.subviews) HaciOSDiscoverChrome(child);
+}
+
 static void HaciOSAttach(id candidate) {
-    HaciOSLog(@"HaciOSAttach called: candidateClass=%@ mainThread=%d", NSStringFromClass([candidate class]), [NSThread isMainThread]);
     __weak id weakCandidate = candidate;
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             id controller = weakCandidate;
-            BOOL compatible = [controller isKindOfClass:[UIViewController class]];
-            BOOL disabled = HaciOSIsDisabled();
-            HaciOSLog(@"HaciOSAttach on main: class=%@ compatible=%d hiddenUntilRespring=%d disabled=%d",
-                      NSStringFromClass([controller class]), compatible, HaciOSHiddenUntilRespring, disabled);
-            if (!compatible || HaciOSHiddenUntilRespring || disabled) {
-                HaciOSLog(@"HaciOSAttach skipped: invalid/released controller, hidden or disabled");
-                return;
-            }
+            if (![controller isKindOfClass:[UIViewController class]]) return;
+            if (HaciOSHiddenUntilRespring || HaciOSIsDisabled()) { [HaciOSOrbit refreshVisibility]; return; }
             if (!HaciOSOrbit) HaciOSOrbit = [[HaciOSCoordinator alloc] init];
             [HaciOSOrbit attachToController:controller];
-        } @catch (NSException *exception) { HaciOSLog(@"attach scheduling failed: %@", exception.name); }
+            // Önceden layout olmuş ayrı dock pencereleri de ilk attach'te saklanır.
+            for (UIWindow *window in UIApplication.sharedApplication.windows) HaciOSDiscoverChrome(window);
+        } @catch (NSException *exception) { HaciOSErrorOnce(@"attach dispatch", exception.name); }
     });
 }
 
 %group HaciOSHome
-// ctor iOS 16 sınıfını, yoksa SBIconController'ı bu hook adına bağlar.
 %hook HaciOSHomeController
 - (void)viewDidLoad {
-    %orig;
-    @try { HaciOSAttach(self); }
-    @catch (NSException *exception) { HaciOSLog(@"home load failed: %@", exception.name); }
+    @try { %orig; HaciOSAttach(self); }
+    @catch (NSException *exception) { HaciOSErrorOnce(@"home load", exception.name); }
 }
 - (void)viewDidAppear:(BOOL)animated {
-    %orig;
-    @try { HaciOSAttach(self); }
-    @catch (NSException *exception) { HaciOSLog(@"home appearance failed: %@", exception.name); }
+    @try { %orig; HaciOSAttach(self); }
+    @catch (NSException *exception) { HaciOSErrorOnce(@"home appear", exception.name); }
 }
 - (void)viewWillDisappear:(BOOL)animated {
-    %orig;
-    @try {
-        if (HaciOSOrbit.owner == (id)self) {
-            HaciOSLog(@"home will disappear: class=%@", NSStringFromClass([self class]));
-            HaciOSOrbit.ownerVisible = NO;
-            [HaciOSOrbit refreshVisibility];
-        }
-    } @catch (NSException *exception) { HaciOSLog(@"home disappearance failed: %@", exception.name); }
+    @try { %orig;
+        if (HaciOSOrbit.owner == (id)self) { HaciOSOrbit.ownerVisible = NO; [HaciOSOrbit refreshVisibility]; }
+    } @catch (NSException *exception) { HaciOSErrorOnce(@"home disappear", exception.name); }
 }
 %end
 %end
@@ -613,72 +980,209 @@ static void HaciOSAttach(id candidate) {
 %group HaciOSFrontDisplay
 %hook SpringBoard
 - (void)frontDisplayDidChange:(id)display {
-    %orig;
-    BOOL home = (display == nil);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @try {
-            HaciOSFrontIsHome = home;
-            HaciOSLog(@"frontDisplayDidChange: displayClass=%@ display=%@ FrontIsHome=%d",
-                      NSStringFromClass([display class]), display, home);
-            [HaciOSOrbit refreshVisibility];
-        } @catch (NSException *exception) { HaciOSLog(@"front display failed: %@", exception.name); }
-    });
+    @try {
+        %orig;
+        BOOL home = display == nil;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            @try { HaciOSFrontIsHome = home; [HaciOSOrbit refreshVisibility]; }
+            @catch (NSException *exception) { HaciOSErrorOnce(@"front display", exception.name); }
+        });
+    } @catch (NSException *exception) { HaciOSErrorOnce(@"front display hook", exception.name); }
+}
+%end
+%end
+
+// Pencere gizlenmesi de timer/CA saatini anında durdursun; uygulama pencerelerini hook'lama.
+%group HaciOSHomeWindow
+%hook HaciOSHomeScreenWindow
+- (void)setHidden:(BOOL)hidden {
+    @try { %orig; [HaciOSOrbit refreshVisibility]; }
+    @catch (NSException *exception) { HaciOSErrorOnce(@"home window hidden", exception.name); }
+}
+- (void)layoutSubviews {
+    @try { %orig; [HaciOSOrbit refreshVisibility]; }
+    @catch (NSException *exception) { HaciOSErrorOnce(@"home window layout", exception.name); }
+}
+%end
+%end
+
+%group HaciOSDock
+%hook HaciOSDockView
+- (void)layoutSubviews {
+    @try { %orig; HaciOSApplyChrome((UIView *)self); }
+    @catch (NSException *exception) { HaciOSErrorOnce(@"dock layout", exception.name); }
+}
+- (void)didMoveToWindow {
+    @try { %orig; HaciOSApplyChrome((UIView *)self); }
+    @catch (NSException *exception) { HaciOSErrorOnce(@"dock window", exception.name); }
+}
+- (void)setAlpha:(CGFloat)alpha {
+    HaciOSChromeState *state = nil;
+    BOOL wasApplying = NO;
+    @try {
+        state = HaciOSStateForChrome((UIView *)self);
+        wasApplying = state.applying;
+        if (state.suppressed && !wasApplying) {
+            state.alpha = alpha; alpha = 0;
+            // Alt/üst sınıfın hook'u aynı isteği ikinci kez kaydetmesin.
+            state.applying = YES;
+        }
+        %orig(alpha);
+    } @catch (NSException *exception) { HaciOSErrorOnce(@"dock alpha", exception.name); }
+    @finally { state.applying = wasApplying; }
+}
+- (void)setUserInteractionEnabled:(BOOL)enabled {
+    HaciOSChromeState *state = nil;
+    BOOL wasApplying = NO;
+    @try {
+        state = HaciOSStateForChrome((UIView *)self);
+        wasApplying = state.applying;
+        if (state.suppressed && !wasApplying) {
+            state.interactive = enabled; enabled = NO;
+            state.applying = YES;
+        }
+        %orig(enabled);
+    } @catch (NSException *exception) { HaciOSErrorOnce(@"dock interaction", exception.name); }
+    @finally { state.applying = wasApplying; }
+}
+%end
+%end
+
+%group HaciOSFloatingDock
+%hook HaciOSFloatingDockView
+- (void)layoutSubviews {
+    @try { %orig; HaciOSApplyChrome((UIView *)self); }
+    @catch (NSException *exception) { HaciOSErrorOnce(@"floating dock layout", exception.name); }
+}
+- (void)didMoveToWindow {
+    @try { %orig; HaciOSApplyChrome((UIView *)self); }
+    @catch (NSException *exception) { HaciOSErrorOnce(@"floating dock window", exception.name); }
+}
+- (void)setAlpha:(CGFloat)alpha {
+    HaciOSChromeState *state = nil;
+    BOOL wasApplying = NO;
+    @try {
+        state = HaciOSStateForChrome((UIView *)self);
+        wasApplying = state.applying;
+        if (state.suppressed && !wasApplying) {
+            state.alpha = alpha; alpha = 0;
+            // Alt/üst sınıfın hook'u aynı isteği ikinci kez kaydetmesin.
+            state.applying = YES;
+        }
+        %orig(alpha);
+    } @catch (NSException *exception) { HaciOSErrorOnce(@"floating dock alpha", exception.name); }
+    @finally { state.applying = wasApplying; }
+}
+- (void)setUserInteractionEnabled:(BOOL)enabled {
+    HaciOSChromeState *state = nil;
+    BOOL wasApplying = NO;
+    @try {
+        state = HaciOSStateForChrome((UIView *)self);
+        wasApplying = state.applying;
+        if (state.suppressed && !wasApplying) {
+            state.interactive = enabled; enabled = NO;
+            state.applying = YES;
+        }
+        %orig(enabled);
+    } @catch (NSException *exception) { HaciOSErrorOnce(@"floating dock interaction", exception.name); }
+    @finally { state.applying = wasApplying; }
+}
+%end
+%end
+
+%group HaciOSPageControl
+%hook HaciOSIconListPageControl
+- (void)layoutSubviews {
+    @try { %orig; HaciOSApplyChrome((UIView *)self); }
+    @catch (NSException *exception) { HaciOSErrorOnce(@"page layout", exception.name); }
+}
+- (void)didMoveToWindow {
+    @try { %orig; HaciOSApplyChrome((UIView *)self); }
+    @catch (NSException *exception) { HaciOSErrorOnce(@"page window", exception.name); }
+}
+- (void)setAlpha:(CGFloat)alpha {
+    HaciOSChromeState *state = nil;
+    BOOL wasApplying = NO;
+    @try {
+        state = HaciOSStateForChrome((UIView *)self);
+        wasApplying = state.applying;
+        if (state.suppressed && !wasApplying) {
+            state.alpha = alpha; alpha = 0;
+            // Alt/üst sınıfın hook'u aynı isteği ikinci kez kaydetmesin.
+            state.applying = YES;
+        }
+        %orig(alpha);
+    } @catch (NSException *exception) { HaciOSErrorOnce(@"page alpha", exception.name); }
+    @finally { state.applying = wasApplying; }
+}
+- (void)setUserInteractionEnabled:(BOOL)enabled {
+    HaciOSChromeState *state = nil;
+    BOOL wasApplying = NO;
+    @try {
+        state = HaciOSStateForChrome((UIView *)self);
+        wasApplying = state.applying;
+        if (state.suppressed && !wasApplying) {
+            state.interactive = enabled; enabled = NO;
+            state.applying = YES;
+        }
+        %orig(enabled);
+    } @catch (NSException *exception) { HaciOSErrorOnce(@"page interaction", exception.name); }
+    @finally { state.applying = wasApplying; }
 }
 %end
 %end
 
 static BOOL HaciOSCanHookHome(Class cls) {
     return cls && [cls isSubclassOfClass:[UIViewController class]] &&
-           class_getInstanceMethod(cls, @selector(viewDidLoad)) &&
-           class_getInstanceMethod(cls, @selector(viewDidAppear:)) &&
-           class_getInstanceMethod(cls, @selector(viewWillDisappear:));
+        class_getInstanceMethod(cls, @selector(viewDidLoad)) && class_getInstanceMethod(cls, @selector(viewDidAppear:)) &&
+        class_getInstanceMethod(cls, @selector(viewWillDisappear:));
+}
+static BOOL HaciOSCanHookChrome(Class cls) {
+    return cls && [cls isSubclassOfClass:[UIView class]] &&
+        class_getInstanceMethod(cls, @selector(layoutSubviews)) && class_getInstanceMethod(cls, @selector(didMoveToWindow)) &&
+        class_getInstanceMethod(cls, @selector(setAlpha:)) && class_getInstanceMethod(cls, @selector(setUserInteractionEnabled:));
 }
 
 %ctor {
     @autoreleasepool {
         @try {
-            HaciOSLog(@"initializing 0.1.1: process=%@ FrontIsHome=%d ScreenBlanked=%d hiddenUntilRespring=%d",
-                      [NSProcessInfo processInfo].processName, HaciOSFrontIsHome, HaciOSScreenBlanked, HaciOSHiddenUntilRespring);
-            if (HaciOSIsDisabled()) {
-                HaciOSLog(@"initialization skipped: disabled sentinel present or disabled check failed");
-                return;
-            }
+            HaciOSLog(@"initializing 0.2.0: native Orbit");
+            if (HaciOSIsDisabled()) return;
             Class homeClass = objc_getClass("SBHomeScreenViewController");
-            if (!HaciOSCanHookHome(homeClass)) {
-                HaciOSLog(@"SBHomeScreenViewController unavailable/incompatible; trying SBIconController");
-                homeClass = objc_getClass("SBIconController");
-            }
-            if (!HaciOSCanHookHome(homeClass)) {
-                HaciOSLog(@"no compatible home controller; skipped");
-                return;
-            }
+            if (!HaciOSCanHookHome(homeClass)) homeClass = objc_getClass("SBIconController");
             Class springBoardClass = objc_getClass("SpringBoard");
-            if (!springBoardClass || !class_getInstanceMethod(springBoardClass, NSSelectorFromString(@"frontDisplayDidChange:"))) {
-                // Uygulamalar üstünde kalma riski varsa overlay'i başlatma.
-                HaciOSLog(@"front display hook unavailable; skipped");
+            Class homeWindow = objc_getClass("SBHomeScreenWindow");
+            if (!HaciOSCanHookHome(homeClass) || !springBoardClass ||
+                !class_getInstanceMethod(springBoardClass, NSSelectorFromString(@"frontDisplayDidChange:")) ||
+                !homeWindow || ![homeWindow isSubclassOfClass:[UIWindow class]]) {
+                HaciOSErrorOnce(@"startup", @"home/front display/window API unavailable; skipped");
                 return;
             }
             uint32_t status = notify_register_dispatch("com.apple.springboard.hasBlankedScreen", &HaciOSBlankToken,
-                                                       dispatch_get_main_queue(), ^(int token) {
-                @try {
-                    HaciOSReadBlankState(token, @"notification");
-                    [HaciOSOrbit refreshVisibility];
-                } @catch (NSException *exception) { HaciOSLog(@"blank screen notification failed: %@", exception.name); }
-            });
+                dispatch_get_main_queue(), ^(int token) {
+                    @try { HaciOSReadBlankState(token); [HaciOSOrbit refreshVisibility]; }
+                    @catch (NSException *exception) { HaciOSErrorOnce(@"blank notification", exception.name); }
+                });
             if (status != NOTIFY_STATUS_OK) {
-                HaciOSBlankToken = -1;
-                HaciOSScreenBlanked = YES;
-                HaciOSLog(@"blank screen notify registration failed: status=%u; continuing with animations paused", status);
-            } else {
-                HaciOSLog(@"blank screen notify registered: token=%d", HaciOSBlankToken);
-                HaciOSReadBlankState(HaciOSBlankToken, @"initial");
+                HaciOSBlankToken = -1; HaciOSScreenBlanked = YES;
+                HaciOSErrorOnce(@"blank registration", @"animations remain paused");
+            } else HaciOSReadBlankState(HaciOSBlankToken);
+            // Her özel sınıf ayrı grupta; bulunmayan dock/page sınıfı sessizce atlanır.
+            Class dockClass = objc_getClass("SBDockView");
+            if (HaciOSCanHookChrome(dockClass)) { %init(HaciOSDock, HaciOSDockView = dockClass); }
+            Class floatingClass = objc_getClass("SBFloatingDockView");
+            if (HaciOSCanHookChrome(floatingClass)) { %init(HaciOSFloatingDock, HaciOSFloatingDockView = floatingClass); }
+            Class pageClass = objc_getClass("SBIconListPageControl");
+            if (HaciOSCanHookChrome(pageClass)) { %init(HaciOSPageControl, HaciOSIconListPageControl = pageClass); }
+            if (class_getInstanceMethod(homeWindow, @selector(setHidden:)) && class_getInstanceMethod(homeWindow, @selector(layoutSubviews))) {
+                %init(HaciOSHomeWindow, HaciOSHomeScreenWindow = homeWindow);
             }
             %init(HaciOSFrontDisplay);
             %init(HaciOSHome, HaciOSHomeController = homeClass);
-            HaciOSLog(@"loaded 0.1.1 (%@)", NSStringFromClass(homeClass));
         } @catch (NSException *exception) {
             HaciOSHiddenUntilRespring = YES;
-            HaciOSLog(@"initialization failed: %@", exception.name);
+            [HaciOSOrbit refreshVisibility];
+            HaciOSErrorOnce(@"initialization", exception.name);
         }
     }
 }

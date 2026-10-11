@@ -8,6 +8,6 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = HaciOS
 HaciOS_FILES = HaciOS.x
 HaciOS_CFLAGS = -fobjc-arc
-HaciOS_FRAMEWORKS = UIKit Foundation QuartzCore WebKit
+HaciOS_FRAMEWORKS = UIKit Foundation QuartzCore CoreGraphics
 
 include $(THEOS_MAKE_PATH)/tweak.mk
